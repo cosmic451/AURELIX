@@ -1,0 +1,9 @@
+{
+  "version": "0.5.57",
+  "released": "2026-09-20",
+  "channel": "stable",
+  "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
+  "changelog": [
+    "Initial AURELIX GitHub update-system release."
+  ]
+}
