@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
-// @namespace    aurelix.auto.engine
+// @author       Cosmic
 // @version      0.5.57
 // @description  AURELIX Auto Engine Update Metadata
 // @updateURL    https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.meta.js
