@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.5.58
+// @version      0.5.62
 // @description  AURELIX automation engine with smart combat, presets, resource recovery, auto loot, and adaptive targeting.
+// @icon         https://raw.githubusercontent.com/cosmic451/afb-assets/main/aurelixauto.png
 // @match        https://demonicscans.org/*
 // @updateURL    https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.meta.js
 // @downloadURL  https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js
@@ -19,7 +20,7 @@
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.5.58',
+  currentVersion: '0.5.62',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -1987,7 +1988,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.5.58';
+  const ENGINE_VERSION = '0.5.62';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -2160,6 +2161,15 @@ async function aurelixGetUpdateStatus(force = false) {
   function saveTargetCatalog() {
     saveObject(ENGINE_STORE.catalog, state.targetCatalog);
   }
+  function newerTargetPolicy(candidate, existing) {
+    if (!candidate) return existing ? { ...existing } : null;
+    if (!existing) return { ...candidate };
+    const candidateAt = Number(candidate.updatedAt) || 0;
+    const existingAt = Number(existing.updatedAt) || 0;
+    // A policy attached to the key currently being canonicalized wins an
+    // exact tie. This protects legacy policies that predate updatedAt.
+    return { ...(candidateAt >= existingAt ? candidate : existing) };
+  }
   function mergeCatalogItem(key, item) {
     if (!key || !item || isNoiseTargetName(item.name)) return null;
     const previous = state.targetCatalog[key] || {};
@@ -2208,9 +2218,8 @@ async function aurelixGetUpdateStatus(force = false) {
       if (canonicalKey !== oldKey) {
         const existing = state.targetCatalog[canonicalKey] || {};
         state.targetCatalog[canonicalKey] = { ...item, ...existing, key: canonicalKey, name: cleanedName };
-        if (state.targetPolicy[oldKey] && !state.targetPolicy[canonicalKey]) {
-          state.targetPolicy[canonicalKey] = { ...state.targetPolicy[oldKey] };
-        }
+        const migratedPolicy = newerTargetPolicy(state.targetPolicy[oldKey], state.targetPolicy[canonicalKey]);
+        if (migratedPolicy) state.targetPolicy[canonicalKey] = migratedPolicy;
         if (state.skillTargetPolicy[oldKey] && !state.skillTargetPolicy[canonicalKey]) {
           state.skillTargetPolicy[canonicalKey] = { ...state.skillTargetPolicy[oldKey] };
         }
@@ -2233,6 +2242,10 @@ async function aurelixGetUpdateStatus(force = false) {
       item.currentlyVisible = false;
       if (item.catalogType === 'gate-family') item.status = 'waiting';
       else if (item.catalogType === 'dungeon-mob') item.status = 'not-visible';
+      else if (item.catalogType === 'dungeon-boss-slot') {
+        item.status = 'waiting';
+        delete item.supersededBy;
+      }
     }
     for (const family of report.gateBossFamilies || []) {
       if (!family?.familyKey || isNoiseTargetName(family.name)) continue;
@@ -2314,7 +2327,13 @@ async function aurelixGetUpdateStatus(force = false) {
         lastSeenAt: now
       });
       const loc = locationByRuntime.get(`${entity.instanceId}:${entity.locationId}`);
-      if (loc?.bossLabel && entity.dungeonName && entity.locationName) {
+      const locationEntityCount = (report.entities || []).filter(candidate =>
+        candidate?.source === 'dungeon' &&
+        Number(candidate.instanceId) === Number(entity.instanceId) &&
+        Number(candidate.locationId) === Number(entity.locationId) &&
+        !isNoiseTargetName(candidate.name)
+      ).length;
+      if (loc?.bossLabel && locationEntityCount === 1 && entity.dungeonName && entity.locationName) {
         const slotKey = dungeonBossSlotKey(entity.dungeonName, entity.locationName);
         const slotPolicy = state.targetPolicy[slotKey];
         const entityPolicy = state.targetPolicy[key];
@@ -2650,7 +2669,7 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!item || item.source !== 'dungeon' || !item.dungeonName || !item.locationName) return;
     const slotKey = dungeonBossSlotKey(item.dungeonName, item.locationName);
     const slot = state.targetCatalog[slotKey];
-    const isBossTarget = item.catalogType === 'dungeon-boss-slot' || !!slot || item.supersededBy === slotKey;
+    const isBossTarget = item.catalogType === 'dungeon-boss-slot' || slot?.supersededBy === key || item.supersededBy === slotKey;
     if (!isBossTarget) return;
     state.targetPolicy[slotKey] = { ...policy };
     for (const candidate of Object.values(state.targetCatalog)) {
@@ -2726,11 +2745,12 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       mirrorDungeonBossPolicy(item.key, state.targetPolicy[item.key]);
     }
-    saveObject(ENGINE_STORE.targets, state.targetPolicy);
+    const saved = saveObject(ENGINE_STORE.targets, state.targetPolicy);
+    if (!saved) pushLog('error', 'Bulk target-policy persistence failed.');
     savePhaseRuntime(state.phaseProgress);
     decideNow();
     emit();
-    return true;
+    return saved !== false;
   }
   function potionKind(potion) {
     return normalizeName(potion?.type || (/\bmana\b|\bmp\b/i.test(potion?.name || '') ? 'mana' : /\bstamina\b/i.test(potion?.name || '') ? 'stamina' : /\bhp\b|\bhealth\b/i.test(potion?.name || '') ? 'hp' : ''));
@@ -4828,9 +4848,10 @@ async function aurelixGetUpdateStatus(force = false) {
       const gap = maxMana - beforeMana;
       const wholeFit = Math.ceil(gap / restorePerPotion);
       qty = Math.max(1, wholeFit);
-    } else if (kind === 'stamina' && options.fillToMax === true && Number.isFinite(beforeStamina) && Number.isFinite(maxStamina) && maxStamina > beforeStamina && restorePerPotion > 0) {
-      qty = Math.max(1, Math.ceil((maxStamina - beforeStamina) / restorePerPotion));
     }
+    // Stamina is deliberately single-use. Every request must be followed by a
+    // fresh resource read and a new combat decision; never send a stamina batch.
+    if (kind === 'stamina') qty = 1;
     qty = Math.max(1, Math.min(qty, remainingByLimit, remainingByCount));
     if (!(qty > 0) || !Number.isFinite(qty)) qty = 1;
     qty = Math.floor(qty);
@@ -4930,6 +4951,11 @@ async function aurelixGetUpdateStatus(force = false) {
         const now = Number(currentMana());
         const max = Number(state.liveResources.manaMax);
         if (Number.isFinite(now)) pushLog('mana', `Mana recovery: ${Math.round(now).toLocaleString()}${Number.isFinite(max) && max > 0 ? `/${Math.round(max).toLocaleString()}` : ''} MP.`);
+      }
+      if (kind === 'stamina') {
+        const now = Number(currentStamina());
+        const max = Number(state.liveResources.staminaMax);
+        if (Number.isFinite(now)) pushLog('stamina', `Stamina after one ${potion.name || 'potion'}: ${Math.round(now).toLocaleString()}${Number.isFinite(max) && max > 0 ? `/${Math.round(max).toLocaleString()}` : ''}.`);
       }
       if (kind === 'hp') pushLog('hp', `HP recovery confirmed (${Math.round(Number(state.liveResources.hp) || 1).toLocaleString()} HP). Resuming combat.`);
       emit();
@@ -5826,14 +5852,39 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     const stamina = currentStamina();
     if (Number.isFinite(stamina) && stamina <= 0) {
-      if (state.settings.autoLoot !== false) {
+      let threshold = smartLootThresholdState(currentExpState());
+      if (!Number.isFinite(threshold.remainingExp)) {
+        const fresh = await fetchFreshPlayerState();
+        threshold = smartLootThresholdState(fresh);
+      }
+      if (threshold.eligible && state.settings.autoLoot !== false) {
         const lootedToRecovery = await trySmartAutoLoot();
         if (lootedToRecovery === true) return true;
         if (lootedToRecovery === 'hold') return false;
       }
-      return await useEmergencyPotion('stamina');
+      return false;
     }
     return false;
+  }
+  async function useOnePotionForPreferredSlash(target, damage, stamina, threshold) {
+    if (!target || threshold?.eligible || !Number.isFinite(Number(threshold?.remainingExp))) return false;
+    const model = getSlashModel(target);
+    if (!(model.damagePerStamina > 0) || model.samples < 1) return false;
+    const staminaMax = Number(state.liveResources.staminaMax ?? window.AURELIX?.getReport?.()?.resources?.player?.staminaMax);
+    const refillCapacity = Number.isFinite(staminaMax) && staminaMax > 0
+      ? Math.max(0, staminaMax)
+      : 1000;
+    const preferredSlash = model.choose({
+      remainingDamage: target.damageLimit - damage,
+      damageLimit: target.damageLimit,
+      staminaAvailable: refillCapacity,
+      softOvershootPct: state.settings.softOvershootPct
+    });
+    // Potions accelerate 50/100/200/1000-stamina attacks only. A 1- or
+    // 10-stamina cleanup slash never justifies consuming a stamina potion.
+    if (!preferredSlash || preferredSlash.stamina < 50 || preferredSlash.stamina <= Math.max(0, Number(stamina) || 0) || !selectedPotion('stamina')) return false;
+    pushLog('stamina', `⚡ Single-potion refill — ${Math.max(0, Math.round(Number(stamina) || 0)).toLocaleString()} stamina cannot fund the damage-safe ${preferredSlash.name}; using one selected stamina potion.`);
+    return await useEmergencyPotion('stamina', { targetStamina: preferredSlash.stamina });
   }
   function extractHitDamage(data, priorTotal) {
     const total = parseNumber(data?.totaldmgdealt);
@@ -6109,7 +6160,15 @@ async function aurelixGetUpdateStatus(force = false) {
       if (!(stamina > 0)) {
         const usedPotion = await handleZeroResourceOnce();
         if (usedPotion) continue;
-        pushLog('warning', `No stamina available for ${target.name}; no usable selected stamina potion is available.`);
+        let zeroThreshold = smartLootThresholdState(currentExpState());
+        if (!Number.isFinite(zeroThreshold.remainingExp)) {
+          const freshResources = await fetchFreshPlayerState();
+          zeroThreshold = smartLootThresholdState(freshResources);
+        }
+        if (await useOnePotionForPreferredSlash(target, damage, stamina, zeroThreshold)) continue;
+        pushLog('warning', zeroThreshold.eligible
+          ? `No stamina available for ${target.name}; EXP is inside the Auto Loot window, so stamina potion use is blocked.`
+          : `No stamina available for ${target.name}; no verified higher slash currently justifies a stamina potion.`);
         return;
       }
       const lootThreshold = smartLootThresholdState(currentExpState());
@@ -6117,9 +6176,7 @@ async function aurelixGetUpdateStatus(force = false) {
         const recoveredByLoot = await trySmartAutoLoot();
         if (recoveredByLoot === true) continue;
         if (recoveredByLoot === 'hold') return;
-        const usedPotion = await useEmergencyPotion('stamina', { fillToMax: true });
-        if (usedPotion) continue;
-        pushLog('warning', `Stamina is below ${AUTO_LOOT_STAMINA_TRIGGER}, but neither eligible loot nor a selected stamina potion restored it.`);
+        pushLog('warning', `Stamina is below ${AUTO_LOOT_STAMINA_TRIGGER} and EXP is inside the Auto Loot window; eligible loot did not restore stamina, and potion use remains blocked.`);
         return;
       }
       if (markTurns(target) > 0) {
@@ -6209,24 +6266,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       if (directUsed) continue;
       const slashModel = getSlashModel(target);
-      // Outside the loot-recovery EXP window, refill before attacking when a
-      // selected potion can unlock a larger damage-safe slash. This avoids slow
-      // 200/10/1-stamina cleanup when the model safely permits a 1000 slash.
-      if (!lootThreshold.eligible && Number.isFinite(lootThreshold.expMax)) {
-        const staminaMax = Number(state.liveResources.staminaMax ?? window.AURELIX?.getReport?.()?.resources?.player?.staminaMax);
-        const refillCapacity = Number.isFinite(staminaMax) && staminaMax > 0 ? Math.max(stamina, staminaMax) : Math.max(stamina, 1000);
-        const preferredSlash = slashModel.choose({
-          remainingDamage: target.damageLimit - damage,
-          damageLimit: target.damageLimit,
-          staminaAvailable: refillCapacity,
-          softOvershootPct: state.settings.softOvershootPct
-        });
-        const canRefill = !Number.isFinite(staminaMax) || stamina < staminaMax;
-        if (preferredSlash && preferredSlash.stamina > stamina && canRefill && selectedPotion('stamina')) {
-          pushLog('stamina', `⚡ Fast refill — ${Math.round(stamina).toLocaleString()} stamina cannot fund the damage-safe ${preferredSlash.name}; using the selected stamina potion before attacking.`);
-          if (await useEmergencyPotion('stamina', { fillToMax: true })) continue;
-        }
-      }
+      if (await useOnePotionForPreferredSlash(target, damage, currentStamina(), lootThreshold)) continue;
       const slash = slashModel.choose({
         remainingDamage: target.damageLimit - damage,
         damageLimit: target.damageLimit,
@@ -6499,7 +6539,10 @@ async function aurelixGetUpdateStatus(force = false) {
       snapshot: saveObject(ENGINE_STORE.manualSnapshot, snapshot)
     };
     const verify = loadObject(ENGINE_STORE.manualSnapshot, {});
-    const verified = verify?.savedAt === savedAt;
+    const verifiedTargets = loadObject(ENGINE_STORE.targets, {});
+    const verified = verify?.savedAt === savedAt &&
+      JSON.stringify(verifiedTargets) === JSON.stringify(state.targetPolicy) &&
+      JSON.stringify(verify?.targets || {}) === JSON.stringify(state.targetPolicy);
     const ok = Object.values(results).every(Boolean) && verified;
     pushLog(ok ? 'success' : 'error', ok ? 'Configuration saved permanently.' : 'Configuration save verification failed.', { savedAt, results, verified });
     return { ok, savedAt, results, verified };
@@ -6556,7 +6599,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const VERSION = '0.5.58';
+  const VERSION = '0.5.62';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
@@ -7881,6 +7924,18 @@ async function aurelixGetUpdateStatus(force = false) {
     potions: true,
     presets: true
   };
+  // Drafts live independently of rendered input elements. A scanner refresh can
+  // rebuild the Targets view, but it must never replace a value the user is
+  // currently editing or waiting to debounce-save.
+  const pendingTargetLimits = new Map();
+  const targetLimitDraftKey = (key, phase) => `${key || ''}|${phase === 'phase3' ? 'phase3' : 'phase1'}`;
+  function displayedTargetLimit(target, phase) {
+    const key = targetLimitDraftKey(target?.key, phase);
+    if (pendingTargetLimits.has(key)) return pendingTargetLimits.get(key);
+    return phase === 'phase3'
+      ? Number(target?.phase3DamageLimit || 0)
+      : Number(target?.phase1DamageLimit ?? target?.damageLimit ?? 0);
+  }
   function isViewActive(name) {
     return !!$(`.ax-view[data-view="${name}"]`)?.classList.contains('active');
   }
@@ -7972,10 +8027,10 @@ async function aurelixGetUpdateStatus(force = false) {
       const prettyName = displayTargetName(t.name || 'Unknown Target');
       const damageControls = t.phaseCapable
         ? `<div class="ax-phase-limits">
-            <label class="ax-phase-limit-box"><span>P1 DMG</span><input class="ax-num ax-target-limit" data-phase="phase1" data-target-key="${safe(t.key || '')}" type="number" min="0" value="${Number(t.phase1DamageLimit ?? t.damageLimit ?? 0)}" placeholder="0"></label>
-            <label class="ax-phase-limit-box"><span>P3 DMG</span><input class="ax-num ax-target-limit" data-phase="phase3" data-target-key="${safe(t.key || '')}" type="number" min="0" value="${Number(t.phase3DamageLimit || 0)}" placeholder="0"></label>
+            <label class="ax-phase-limit-box"><span>P1 DMG</span><input class="ax-num ax-target-limit" data-phase="phase1" data-target-key="${safe(t.key || '')}" type="number" min="0" value="${displayedTargetLimit(t, 'phase1')}" placeholder="0"></label>
+            <label class="ax-phase-limit-box"><span>P3 DMG</span><input class="ax-num ax-target-limit" data-phase="phase3" data-target-key="${safe(t.key || '')}" type="number" min="0" value="${displayedTargetLimit(t, 'phase3')}" placeholder="0"></label>
           </div>`
-        : `<input class="ax-num ax-target-limit" data-phase="phase1" data-target-key="${safe(t.key || '')}" type="number" min="0" value="${Number(t.phase1DamageLimit ?? t.damageLimit ?? 0)}" placeholder="Damage limit">`;
+        : `<input class="ax-num ax-target-limit" data-phase="phase1" data-target-key="${safe(t.key || '')}" type="number" min="0" value="${displayedTargetLimit(t, 'phase1')}" placeholder="Damage limit">`;
       return `
         <div class="ax-target-row${t.enabled ? ' is-selected' : ''}" data-target-key="${safe(t.key || '')}">
           <input class="ax-target-check" type="checkbox" data-target-key="${safe(t.key || '')}" ${t.enabled ? 'checked' : ''} title="Enable target">
@@ -8180,8 +8235,10 @@ async function aurelixGetUpdateStatus(force = false) {
     const damageLimit = Math.max(0, Math.floor(Number(input.value) || 0));
     input.value = String(damageLimit);
     const phase = input.dataset.phase === 'phase3' ? 'phase3' : 'phase1';
+    const draftKey = targetLimitDraftKey(input.dataset.targetKey, phase);
     const patch = phase === 'phase3' ? { phase3DamageLimit: damageLimit } : { damageLimit, phase1DamageLimit: damageLimit };
-    window.AURELIX_ENGINE?.setTargetPolicy?.(input.dataset.targetKey, patch);
+    const saved = window.AURELIX_ENGINE?.setTargetPolicy?.(input.dataset.targetKey, patch);
+    if (saved !== false) pendingTargetLimits.delete(draftKey);
     const item = appState.targets.find(t => t.key === input.dataset.targetKey);
     if (item) {
       if (phase === 'phase3') item.phase3DamageLimit = damageLimit;
@@ -8410,6 +8467,8 @@ async function aurelixGetUpdateStatus(force = false) {
     if (el instanceof Element && el.matches('#ax-pet-builder-name')) { if (petBuilder) petBuilder.name = el.value; return; }
     if (el instanceof Element && el.matches('#ax-pet-picker-search')) { renderPetPicker(el.value); return; }
     if (!(el instanceof Element) || !el.matches('.ax-target-limit')) return;
+    const phase = el.dataset.phase === 'phase3' ? 'phase3' : 'phase1';
+    pendingTargetLimits.set(targetLimitDraftKey(el.dataset.targetKey, phase), Math.max(0, Math.floor(Number(el.value) || 0)));
     const prior = targetSaveTimers.get(el);
     if (prior) clearTimeout(prior);
     targetSaveTimers.set(el, setTimeout(() => commitTargetLimit(el), 180));
