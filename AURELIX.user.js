@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.5.57
+// @version      0.5.58
 // @description  AURELIX automation engine with smart combat, presets, resource recovery, auto loot, and adaptive targeting.
 // @match        https://demonicscans.org/*
 // @updateURL    https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.meta.js
@@ -19,7 +19,7 @@
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.5.57',
+  currentVersion: '0.5.58',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -1987,7 +1987,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.5.57';
+  const ENGINE_VERSION = '0.5.58';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -6556,7 +6556,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const VERSION = '0.5.57';
+  const VERSION = '0.5.58';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
