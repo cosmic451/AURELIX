@@ -1,11 +1,8 @@
 {
-  "version": "0.5.58",
+  "version": "0.5.62",
   "released": "2026-09-20",
   "channel": "stable",
   "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
  "changelog": [
-  "Added the AURELIX GitHub update system and in-panel Update Center.",
-  "Added reliable cache-proof release checking.",
-  "Added direct Tampermonkey update installation from the AURELIX panel."
-]
+  "features": ["Smart combat, phase targeting, preset switching, resource recovery, and auto-loot."]
 }
