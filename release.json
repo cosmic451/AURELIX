@@ -4,7 +4,6 @@
   "channel": "stable",
   "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
  "changelog": [
-  "features":
    "Smart combat, phase targeting, preset switching, resource recovery, and auto-loot."
  ]
 }
