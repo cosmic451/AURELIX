@@ -1,9 +1,14 @@
 {
   "version": "0.5.67",
-  "released": "2026-09-20",
+  "released": "2026-09-21",
   "channel": "stable",
   "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
- "changelog": [
-   "Smart combat,phase targeting,preset switching,resource recovery,and auto-loot."
- ]
+  "changelog": [
+    "Improved smart combat, phase targeting, and Active Skill handling.",
+    "Added automatic equipment and pet preset switching with loadout priority.",
+    "Added higher-Slash stamina refilling with protection against repeated potion use.",
+    "Improved Small Stamina Potion batching and level-up Auto Loot.",
+    "Improved dungeon and Gate/Wave loot verification and retry protection.",
+    "Improved performance, mobile compatibility, themes, persistence, and code structure."
+  ]
 }
