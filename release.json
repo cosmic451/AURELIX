@@ -1,9 +1,13 @@
 {
-  "version": "0.5.62",
-  "released": "2026-09-20",
+  "version": "0.5.67",
+  "released": "2026-09-21",
   "channel": "stable",
   "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
  "changelog": [
-   "Smart combat, phase targeting, preset switching, resource recovery, and auto-loot."
+   "Smart combat
+    phase targeting
+    preset switching
+    resource recovery,
+    and auto-loot."
  ]
 }
