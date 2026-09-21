@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.5.62
+// @version      0.5.67
 // @description  AURELIX automation engine with smart combat, presets, resource recovery, auto loot, and adaptive targeting.
 // @icon         https://raw.githubusercontent.com/cosmic451/afb-assets/main/aurelixauto.png
 // @match        https://demonicscans.org/*
@@ -20,7 +20,7 @@
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.5.62',
+  currentVersion: '0.5.67',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -1936,11 +1936,13 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   function copyReport() {
     const json = JSON.stringify(state.lastReport, null, 2);
-    if (typeof copy === 'function') {
-      copy(json);
+    const devtoolsCopy = globalThis.copy;
+    if (typeof devtoolsCopy === 'function') {
+      devtoolsCopy(json);
       return true;
     }
-    return navigator.clipboard.writeText(json).then(() => true);
+    if (!navigator.clipboard?.writeText) return Promise.resolve(false);
+    return navigator.clipboard.writeText(json).then(() => true, () => false);
   }
   function status() {
     return {
@@ -1988,7 +1990,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.5.62';
+  const ENGINE_VERSION = '0.5.67';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -2020,6 +2022,8 @@ async function aurelixGetUpdateStatus(force = false) {
     phasePollMs: 1500,
     softOvershootPct: 0.04
   });
+  const DUNGEON_LOOT_SWEEP_MIN_MS = 5000;
+  const LOOT_REJECT_COOLDOWN_MS = 120000;
   const SLASH_TIERS = Object.freeze([
     { name: 'World Breaker Slash', skillId: -5, stamina: 1000 },
     { name: 'Legendary Slash',skillId: -4, stamina: 200 },
@@ -2476,10 +2480,14 @@ async function aurelixGetUpdateStatus(force = false) {
     combatLoopPromise: null,
     attackInFlight: false,
     potionInFlight: false,
+    staminaPotionAwaitingAction: false,
     lootInFlight: false,
     dungeonLootSweepPending: false,
     dungeonLootSweepPromise: null,
     lastDungeonLootSweepAt: 0,
+    lastSmartLootAttemptAt: 0,
+    dungeonLootRetryAfter: 0,
+    lootCandidateRejectedUntil: new Map(),
     potionUsage: {},
     encounterLedger: {},
     phaseProgress: loadPhaseRuntime(),
@@ -4489,6 +4497,10 @@ async function aurelixGetUpdateStatus(force = false) {
   function noteCombatAction(target) {
     const key = runtimeEncounterKey(target);
     if (state.combatPreflight.key === key) state.combatPreflight.actionsSinceFresh = Number(state.combatPreflight.actionsSinceFresh || 0) + 1;
+    // A confirmed combat action unlocks the next possible stamina refill. This
+    // prevents consecutive Large/Full/Adventure potion requests without an
+    // attack between them.
+    state.staminaPotionAwaitingAction = false;
   }
   function acceptAuthoritativeAttackTotal(target, priorTotal, data) {
     const total = parseNumber(data?.totaldmgdealt);
@@ -4839,7 +4851,8 @@ async function aurelixGetUpdateStatus(force = false) {
     const maxStamina = Number(state.liveResources.staminaMax ?? window.AURELIX?.getReport?.()?.resources?.player?.staminaMax);
     const learnedRestore = Number(state.observedPotionRestore[usageKey]);
     const declaredRestore = Number(potion.restoreAmount ?? potion.restore ?? potion.amount);
-    const restorePerPotion = learnedRestore > 0 ? learnedRestore : (declaredRestore > 0 ? declaredRestore : null);
+    const isSmallStaminaPotion = kind === 'stamina' && /\bsmall\s+stamina\s+potion\b/i.test(potion.name || potion.rawName || '');
+    const restorePerPotion = isSmallStaminaPotion ? 20 : (learnedRestore > 0 ? learnedRestore : (declaredRestore > 0 ? declaredRestore : null));
     const count = Number(potion.count ?? potion.max);
     const remainingByLimit = limit > 0 ? Math.max(0, limit - used) : Infinity;
     const remainingByCount = Number.isFinite(count) && count >= 0 ? Math.max(0, count - used) : Infinity;
@@ -4849,9 +4862,15 @@ async function aurelixGetUpdateStatus(force = false) {
       const wholeFit = Math.ceil(gap / restorePerPotion);
       qty = Math.max(1, wholeFit);
     }
-    // Stamina is deliberately single-use. Every request must be followed by a
-    // fresh resource read and a new combat decision; never send a stamina batch.
-    if (kind === 'stamina') qty = 1;
+    // Large, Full and Adventure stamina potions are always single-use. Small
+    // Stamina Potions restore exactly 20 each and may be sent as one calculated
+    // batch containing only the minimum quantity needed to reach max stamina.
+    if (kind === 'stamina') {
+      qty = 1;
+      if (isSmallStaminaPotion && options.fillToMax === true && Number.isFinite(beforeStamina) && Number.isFinite(maxStamina) && maxStamina > beforeStamina) {
+        qty = Math.max(1, Math.ceil((maxStamina - beforeStamina) / 20));
+      }
+    }
     qty = Math.max(1, Math.min(qty, remainingByLimit, remainingByCount));
     if (!(qty > 0) || !Number.isFinite(qty)) qty = 1;
     qty = Math.floor(qty);
@@ -4892,11 +4911,17 @@ async function aurelixGetUpdateStatus(force = false) {
       if (kind === 'mana' && consumed > 1) {
         pushLog('mana', `Mana batch ×${consumed} ${potion.name || 'Potion'}${Number.isFinite(beforeMana) && Number.isFinite(maxMana) ? ` (${Math.round(beforeMana)}/${Math.round(maxMana)} MP → refill)` : ''}.`);
       }
+      if (kind === 'stamina' && isSmallStaminaPotion && consumed > 1) {
+        pushLog('stamina', `Small Stamina Potion batch ×${consumed}${Number.isFinite(beforeStamina) && Number.isFinite(maxStamina) ? ` (${Math.round(beforeStamina)}/${Math.round(maxStamina)} stamina → refill)` : ''}.`);
+      }
       state.potionUsage[usageKey] = used + consumed;
       if (consumed > 0) {
         state.session.stats.potions += consumed;
         if (kind === 'hp') state.session.stats.hpPotions += consumed;
-        else if (kind === 'stamina') state.session.stats.staminaPotions += consumed;
+        else if (kind === 'stamina') {
+          state.session.stats.staminaPotions += consumed;
+          state.staminaPotionAwaitingAction = true;
+        }
         else if (kind === 'mana') state.session.stats.manaPotions += consumed;
       }
       if (data) {
@@ -4955,7 +4980,7 @@ async function aurelixGetUpdateStatus(force = false) {
       if (kind === 'stamina') {
         const now = Number(currentStamina());
         const max = Number(state.liveResources.staminaMax);
-        if (Number.isFinite(now)) pushLog('stamina', `Stamina after one ${potion.name || 'potion'}: ${Math.round(now).toLocaleString()}${Number.isFinite(max) && max > 0 ? `/${Math.round(max).toLocaleString()}` : ''}.`);
+        if (Number.isFinite(now)) pushLog('stamina', `Stamina after ${consumed > 1 ? `${consumed} potions` : `one ${potion.name || 'potion'}`}: ${Math.round(now).toLocaleString()}${Number.isFinite(max) && max > 0 ? `/${Math.round(max).toLocaleString()}` : ''}.`);
       }
       if (kind === 'hp') pushLog('hp', `HP recovery confirmed (${Math.round(Number(state.liveResources.hp) || 1).toLocaleString()} HP). Resuming combat.`);
       emit();
@@ -5046,19 +5071,6 @@ async function aurelixGetUpdateStatus(force = false) {
     const value = normalizeSpace(named?.textContent || card?.dataset?.name || card?.dataset?.monsterName || '');
     return value || 'Monster';
   }
-  function rewardUpToLevel(node) {
-    const text = normalizeSpace(node?.textContent || node || '');
-    const match = text.match(/\brewards?\s+(?:are\s+)?(?:available\s+)?(?:up\s*to|upto)\s*(?:level|lvl)?\s*[:#-]?\s*([\d,]+)/i)
-      || text.match(/\brewards?\s+(?:are\s+)?(?:available\s+)?(?:up\s*to|upto)\s*[:#-]?\s*([\d,]+)\s*(?:level|lvl)\b/i);
-    const value = match ? parseNumber(match[1]) : null;
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
-  }
-  function candidateCanRewardExp(candidate, playerLevel) {
-    const rawCap = candidate?.rewardUpToLevel;
-    const cap = rawCap == null || rawCap === '' ? null : Number(rawCap);
-    const level = Number(playerLevel);
-    return !Number.isFinite(cap) || !Number.isFinite(level) || level <= cap;
-  }
   function dungeonLootCandidateFromCard(card, loc) {
     // Boss cards do not consistently render a joined badge. The battle-page
     // verifier remains the authority before any loot claim is attempted.
@@ -5098,7 +5110,6 @@ async function aurelixGetUpdateStatus(force = false) {
       locationId: parseNumber(loc.locationId),
       dgmid,
       battleUrl,
-      rewardUpToLevel: rewardUpToLevel(card),
       key: `dungeon:${instanceId}:${dgmid}`
     };
   }
@@ -5188,7 +5199,6 @@ async function aurelixGetUpdateStatus(force = false) {
       waveId: parseNumber(wave?.waveId),
       monsterId,
       battleUrl,
-      rewardUpToLevel: rewardUpToLevel(card),
       key: `gate:${monsterId}`
     };
   }
@@ -5296,7 +5306,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       const userId = parseUserId(doc);
       if (!userId) return null;
-      return { doc, cfg, userId, rewardUpToLevel: rewardUpToLevel(doc.body) };
+      return { doc, cfg, userId };
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
       return null;
@@ -5318,18 +5328,13 @@ async function aurelixGetUpdateStatus(force = false) {
     const m = String(text || '').match(/(?:EXP|XP)\s*(?:gained|earned)?\s*[:+]\s*([\d,]+)/i);
     return m ? Math.max(0, parseNumber(m[1]) || 0) : 0;
   }
-  async function claimOneLoot(candidate, { requireExpEligible = false, playerLevel = null } = {}) {
+  async function claimOneLoot(candidate) {
     const verified = await verifyLootCandidate(candidate);
     if (!verified) {
-      pushLog('loot', `AUTO LOOT — skipped ${candidate.source} ${candidate.name}: fresh battle page did not confirm joined + dead + unclaimed loot.`);
+      const retryAt = Date.now() + LOOT_REJECT_COOLDOWN_MS;
+      state.lootCandidateRejectedUntil.set(candidate.key, retryAt);
+      pushLog('loot', `AUTO LOOT — skipped ${candidate.source} ${candidate.name}: fresh battle page did not confirm joined + dead + unclaimed loot; retry paused for 2 minutes.`);
       return { ok: false, reason: 'not-lootable' };
-    }
-    const verifiedCap = verified.rewardUpToLevel == null || verified.rewardUpToLevel === '' ? null : Number(verified.rewardUpToLevel);
-    const listedCap = candidate.rewardUpToLevel == null || candidate.rewardUpToLevel === '' ? null : Number(candidate.rewardUpToLevel);
-    const rewardCap = Number.isFinite(verifiedCap) ? verifiedCap : (Number.isFinite(listedCap) ? listedCap : null);
-    const level = Number(playerLevel);
-    if (requireExpEligible && Number.isFinite(rewardCap) && Number.isFinite(level) && level > rewardCap) {
-      return { ok:false, reason:'reward-capped', rewardCap };
     }
     const body = new URLSearchParams();
     if (candidate.source === 'dungeon') {
@@ -5367,6 +5372,7 @@ async function aurelixGetUpdateStatus(force = false) {
       return { ok: false, reason: 'rejected', message };
     }
     const expGained = extractLootExp(data, text);
+    state.lootCandidateRejectedUntil.delete(candidate.key);
     state.session.stats.xpLooted += expGained;
     state.session.stats.mobsLooted += 1;
     state.session.stats.mobsUnlooted = Math.max(0, Number(state.session.stats.mobsUnlooted || 0) - 1);
@@ -5375,30 +5381,28 @@ async function aurelixGetUpdateStatus(force = false) {
     return { ok: true, expGained };
   }
   async function processLootCandidates(candidates, { stopOnRecovery = false, initialLevel = null, initialStamina = null, reserveOne = true } = {}) {
-    const level = Number(initialLevel || currentExpState().level);
-    let queue = Array.isArray(candidates) ? [...candidates] : [];
+    const startingLevel = Number(initialLevel);
+    const now = Date.now();
+    for (const [key, retryAt] of state.lootCandidateRejectedUntil) {
+      if (!(Number(retryAt) > now)) state.lootCandidateRejectedUntil.delete(key);
+    }
+    let queue = Array.isArray(candidates)
+      ? candidates.filter(candidate => !(Number(state.lootCandidateRejectedUntil.get(candidate?.key)) > now))
+      : [];
     if (!stopOnRecovery && reserveOne) {
-      const reservable = queue.filter(candidate => candidate.rewardUpToLevel != null && candidate.rewardUpToLevel !== '' && Number.isFinite(Number(candidate.rewardUpToLevel)) && candidateCanRewardExp(candidate, level));
-      const unknownCap = queue.filter(candidate => candidate.rewardUpToLevel == null || candidate.rewardUpToLevel === '');
-      const reserve = reservable[reservable.length - 1] || unknownCap[unknownCap.length - 1] || null;
+      const reserve = queue[queue.length - 1] || null;
       if (reserve) {
         queue = queue.filter(candidate => candidate.key !== reserve.key);
-        const verifiedLabel = reservable.includes(reserve) ? 'level-eligible' : 'potential';
-        pushLog('loot', `AUTO LOOT — reserved ${reserve.name} as one ${verifiedLabel} EXP loot for emergency stamina recovery.`);
+        pushLog('loot', `AUTO LOOT — reserved ${reserve.name} as one emergency recovery loot.`);
       }
     }
     const attempted = new Set();
     let claimedAny = false;
-    let rewardCapped = 0;
     for (const candidate of queue) {
       if (state.status !== ENGINE_STATES.RUNNING) break;
       if (attempted.has(candidate.key)) continue;
       attempted.add(candidate.key);
-      const result = await claimOneLoot(candidate, { requireExpEligible:stopOnRecovery, playerLevel:level });
-      if (result.reason === 'reward-capped') {
-        rewardCapped += 1;
-        continue;
-      }
+      const result = await claimOneLoot(candidate);
       if (!result.ok) continue;
       claimedAny = true;
       if (!stopOnRecovery) {
@@ -5408,22 +5412,14 @@ async function aurelixGetUpdateStatus(force = false) {
       await sleep(40);
       const after = await fetchFreshPlayerState();
       if (after) {
-        if (Number(after.level) > Number(initialLevel || 0)) {
+        if (startingLevel > 0 && Number(after.level) > startingLevel) {
           if (!(after.stamina > 0) && Number.isFinite(after.staminaMax) && after.staminaMax > 0) state.liveResources.stamina = after.staminaMax;
-          pushLog('success', `🎉 AUTO LOOT — LEVEL UP${initialLevel ? ` ${initialLevel} → ${after.level}` : ` → ${after.level}`}.`);
-          emit();
-          return 'recovered';
-        }
-        if (Number(after.stamina) > Math.max(0, Number(initialStamina) || 0)) {
-          pushLog('success', '🎉 AUTO LOOT — stamina restored by loot; loot stopped immediately.');
+          pushLog('success', `🎉 AUTO LOOT — LEVEL UP ${startingLevel} → ${after.level}.`);
           emit();
           return 'recovered';
         }
       }
       await sleep(20);
-    }
-    if (stopOnRecovery && rewardCapped > 0) {
-      pushLog('loot', `AUTO LOOT — ${rewardCapped} monster${rewardCapped === 1 ? '' : 's'} had an explicitly verified reward cap below level ${level}; unknown-cap monsters were still checked normally.`);
     }
     return claimedAny ? 'claimed' : 'none';
   }
@@ -5431,23 +5427,37 @@ async function aurelixGetUpdateStatus(force = false) {
     if (state.status !== ENGINE_STATES.RUNNING || state.settings.autoLoot === false) return false;
     if (state.lootInFlight) return false;
     const now = Date.now();
-    if (!force && now - Number(state.lastDungeonLootSweepAt || 0) < 8000) return false;
+    const elapsed = now - Number(state.lastDungeonLootSweepAt || 0);
+    // Even emergency/forced passes must respect a hard floor. Without this,
+    // one ambiguous card can trigger several full location scans per second.
+    if (elapsed < (force ? DUNGEON_LOOT_SWEEP_MIN_MS : 8000)) return false;
+    if (now < Number(state.dungeonLootRetryAfter || 0)) return false;
     state.lootInFlight = true;
     state.lastDungeonLootSweepAt = now;
     try {
+      const discovered = await discoverDungeonLootCandidates();
+      const checkedAt = Date.now();
+      const dungeonCandidates = discovered.filter(candidate => !(Number(state.lootCandidateRejectedUntil.get(candidate.key)) > checkedAt));
+      state.session.stats.mobsUnlooted = new Set(dungeonCandidates.map(x => x.key)).size;
+      emit();
+      if (!dungeonCandidates.length) {
+        if (discovered.length) state.dungeonLootRetryAfter = checkedAt + 30000;
+        return false;
+      }
       const fresh = await fetchFreshPlayerState();
       const initialLevel = Number(fresh?.level) || null;
       pushLog('loot', 'AUTO LOOT — Dungeon priority sweep.');
-      const dungeonCandidates = await discoverDungeonLootCandidates();
-      state.session.stats.mobsUnlooted = new Set(dungeonCandidates.map(x => x.key)).size;
-      emit();
-      if (!dungeonCandidates.length) return false;
       pushLog('loot', `AUTO LOOT — ${dungeonCandidates.length} dead + unclaimed Dungeon candidate${dungeonCandidates.length === 1 ? '' : 's'} found; verifying and claiming Dungeon loot first.`);
       // Dungeon bosses are explicit priority loot: never reserve one of them.
       // The emergency reserve is maintained by the Gate/Wave loot pool instead.
       const result = await processLootCandidates(dungeonCandidates, { stopOnRecovery, initialLevel, initialStamina:fresh?.stamina, reserveOne:false });
-      if (result === 'recovered') return 'recovered';
-      if (result === 'claimed') return 'claimed';
+      if (result === 'recovered' || result === 'claimed') {
+        state.dungeonLootRetryAfter = 0;
+        return result;
+      }
+      if (dungeonCandidates.every(candidate => Number(state.lootCandidateRejectedUntil.get(candidate.key)) > Date.now())) {
+        state.dungeonLootRetryAfter = Date.now() + 30000;
+      }
       return false;
     } finally {
       state.lootInFlight = false;
@@ -5457,37 +5467,43 @@ async function aurelixGetUpdateStatus(force = false) {
   async function runPendingDungeonLootSweep() {
     if (!state.dungeonLootSweepPending || state.settings.autoLoot === false || state.status !== ENGINE_STATES.RUNNING) return false;
     if (state.attackInFlight || state.potionInFlight || state.lootInFlight) return false;
+    state.dungeonLootSweepPending = false;
+    if (!(Number(currentStamina()) < AUTO_LOOT_STAMINA_TRIGGER)) return false;
     if (state.dungeonLootSweepPromise) return state.dungeonLootSweepPromise;
-    state.dungeonLootSweepPromise = tryPriorityDungeonLoot({ force: true }).finally(() => { state.dungeonLootSweepPromise = null; });
+    state.dungeonLootSweepPromise = trySmartAutoLoot().finally(() => { state.dungeonLootSweepPromise = null; });
     return state.dungeonLootSweepPromise;
   }
   async function trySmartAutoLoot() {
     if (state.lootInFlight || state.status !== ENGINE_STATES.RUNNING || state.settings.autoLoot === false) return false;
+    const attemptAt = Date.now();
+    if (attemptAt - Number(state.lastSmartLootAttemptAt || 0) < 10000) return false;
     const startingStamina = currentStamina();
     if (Number.isFinite(startingStamina) && startingStamina >= AUTO_LOOT_STAMINA_TRIGGER) return false;
-
-    // Dungeon loot is always the first recovery source. This pass is not blocked by
-    // the Gate EXP threshold because Dungeon priority is an explicit user policy.
-    const dungeonResult = await tryPriorityDungeonLoot({ stopOnRecovery: true, force: true });
-    if (dungeonResult === 'recovered' || Number(currentStamina()) >= AUTO_LOOT_STAMINA_TRIGGER) return true;
+    state.lastSmartLootAttemptAt = attemptAt;
 
     const fresh = await fetchFreshPlayerState();
     if (!fresh) {
-      pushLog('warning', 'AUTO LOOT — could not verify fresh EXP/Level after Dungeon sweep; falling back to stamina potion.');
+      pushLog('warning', 'AUTO LOOT — could not verify fresh EXP/Level; no loot request was sent.');
       return false;
     }
     const threshold = smartLootThresholdState(fresh);
     if (!threshold.eligible) {
       if (Number.isFinite(threshold.exp) && Number.isFinite(threshold.thresholdAmount)) {
-        pushLog('loot', `AUTO LOOT — Dungeon sweep complete; ${Math.round(threshold.remainingExp).toLocaleString()} EXP remains, above the ${threshold.thresholdPct}% Gate recovery window (${Math.round(threshold.thresholdAmount).toLocaleString()}); using stamina potion.`);
+        pushLog('loot', `AUTO LOOT — ${Math.round(threshold.remainingExp).toLocaleString()} EXP remains, outside the ${threshold.thresholdPct}% level-up window; loot is preserved for later.`);
       }
       return false;
     }
     const initialLevel = Number(fresh.level);
     if (!(initialLevel > 0)) {
-      pushLog('warning', 'AUTO LOOT — player level could not be verified; falling back to stamina potion.');
+      pushLog('warning', 'AUTO LOOT — player level could not be verified; no loot request was sent.');
       return false;
     }
+    // Inside the configured level-up window, previous Dungeon instances are
+    // checked first, followed by every known Gate/Wave unclaimed-kill page.
+    // Each successful claim is followed by a fresh level check.
+    const dungeonResult = await tryPriorityDungeonLoot({ stopOnRecovery: true, force: true });
+    if (dungeonResult === 'recovered' || Number(currentExpState().level) > initialLevel) return true;
+
     state.lootInFlight = true;
     try {
       pushLog('loot', `🎁 AUTO LOOT — Gate recovery pass: Stamina ${Math.max(0, Math.round(Number(currentStamina()) || 0))} (<${AUTO_LOOT_STAMINA_TRIGGER}) and ${Math.round(threshold.remainingExp).toLocaleString()} EXP remains inside the ${threshold.thresholdPct}% window.`);
@@ -5495,13 +5511,13 @@ async function aurelixGetUpdateStatus(force = false) {
       state.session.stats.mobsUnlooted = new Set(gateCandidates.map(x => x.key)).size;
       emit();
       if (!gateCandidates.length) {
-        pushLog('loot', 'AUTO LOOT — no eligible Gate/Wave loot found after Dungeon priority pass.');
+        pushLog('loot', 'AUTO LOOT — no joined, dead, unclaimed Gate/Wave loot found after Dungeon priority pass.');
         return false;
       }
       pushLog('loot', `AUTO LOOT — ${gateCandidates.length} joined + dead + unclaimed Gate candidate${gateCandidates.length === 1 ? '' : 's'} found.`);
       const result = await processLootCandidates(gateCandidates, { stopOnRecovery: true, initialLevel, initialStamina:fresh.stamina });
       if (result === 'recovered') return true;
-      pushLog('warning', 'AUTO LOOT — eligible Gate loot exhausted without stamina recovery; falling back to selected stamina potion.');
+      pushLog('warning', 'AUTO LOOT — available Gate/Wave loot was exhausted without a level-up; stamina potion remains blocked inside the EXP window.');
       return false;
     } finally {
       state.lootInFlight = false;
@@ -5852,39 +5868,40 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     const stamina = currentStamina();
     if (Number.isFinite(stamina) && stamina <= 0) {
-      let threshold = smartLootThresholdState(currentExpState());
-      if (!Number.isFinite(threshold.remainingExp)) {
-        const fresh = await fetchFreshPlayerState();
-        threshold = smartLootThresholdState(fresh);
-      }
+      const fresh = await fetchFreshPlayerState();
+      const threshold = smartLootThresholdState(fresh || currentExpState());
       if (threshold.eligible && state.settings.autoLoot !== false) {
         const lootedToRecovery = await trySmartAutoLoot();
         if (lootedToRecovery === true) return true;
         if (lootedToRecovery === 'hold') return false;
+        return false;
+      }
+      if (!threshold.eligible && Number.isFinite(threshold.remainingExp)) {
+        pushLog('stamina', '⚡ Stamina is below 10 and EXP is outside the Auto Loot window; applying the selected stamina-potion rule.');
+        return await useEmergencyPotion('stamina', { fillToMax: true });
       }
       return false;
     }
     return false;
   }
-  async function useOnePotionForPreferredSlash(target, damage, stamina, threshold) {
+  async function usePotionForHigherSlash(target, damage, stamina, threshold) {
+    const available = Number(stamina);
     if (!target || threshold?.eligible || !Number.isFinite(Number(threshold?.remainingExp))) return false;
+    if (!(available >= AUTO_LOOT_STAMINA_TRIGGER) || state.staminaPotionAwaitingAction) return false;
+    if (!selectedPotion('stamina')) return false;
     const model = getSlashModel(target);
     if (!(model.damagePerStamina > 0) || model.samples < 1) return false;
     const staminaMax = Number(state.liveResources.staminaMax ?? window.AURELIX?.getReport?.()?.resources?.player?.staminaMax);
-    const refillCapacity = Number.isFinite(staminaMax) && staminaMax > 0
-      ? Math.max(0, staminaMax)
-      : 1000;
+    if (!(staminaMax > available)) return false;
     const preferredSlash = model.choose({
       remainingDamage: target.damageLimit - damage,
       damageLimit: target.damageLimit,
-      staminaAvailable: refillCapacity,
+      staminaAvailable: staminaMax,
       softOvershootPct: state.settings.softOvershootPct
     });
-    // Potions accelerate 50/100/200/1000-stamina attacks only. A 1- or
-    // 10-stamina cleanup slash never justifies consuming a stamina potion.
-    if (!preferredSlash || preferredSlash.stamina < 50 || preferredSlash.stamina <= Math.max(0, Number(stamina) || 0) || !selectedPotion('stamina')) return false;
-    pushLog('stamina', `⚡ Single-potion refill — ${Math.max(0, Math.round(Number(stamina) || 0)).toLocaleString()} stamina cannot fund the damage-safe ${preferredSlash.name}; using one selected stamina potion.`);
-    return await useEmergencyPotion('stamina', { targetStamina: preferredSlash.stamina });
+    if (!preferredSlash || !(Number(preferredSlash.stamina) > available)) return false;
+    pushLog('stamina', `⚡ ${preferredSlash.name} needs ${preferredSlash.stamina.toLocaleString()} stamina; only ${Math.max(0, Math.round(available)).toLocaleString()} is available. Using the selected stamina potion once before recalculating.`);
+    return await useEmergencyPotion('stamina', { fillToMax: true });
   }
   function extractHitDamage(data, priorTotal) {
     const total = parseNumber(data?.totaldmgdealt);
@@ -6165,18 +6182,30 @@ async function aurelixGetUpdateStatus(force = false) {
           const freshResources = await fetchFreshPlayerState();
           zeroThreshold = smartLootThresholdState(freshResources);
         }
-        if (await useOnePotionForPreferredSlash(target, damage, stamina, zeroThreshold)) continue;
         pushLog('warning', zeroThreshold.eligible
           ? `No stamina available for ${target.name}; EXP is inside the Auto Loot window, so stamina potion use is blocked.`
-          : `No stamina available for ${target.name}; no verified higher slash currently justifies a stamina potion.`);
+          : `No stamina available for ${target.name}; the selected stamina potion could not be used.`);
         return;
       }
-      const lootThreshold = smartLootThresholdState(currentExpState());
+      let lootThreshold = smartLootThresholdState(currentExpState());
+      if (stamina < AUTO_LOOT_STAMINA_TRIGGER) {
+        const freshDecision = await fetchFreshPlayerState();
+        if (freshDecision) {
+          stamina = Number.isFinite(Number(freshDecision.stamina)) ? Number(freshDecision.stamina) : stamina;
+          lootThreshold = smartLootThresholdState(freshDecision);
+        }
+      }
       if (lootThreshold.eligible && stamina < AUTO_LOOT_STAMINA_TRIGGER) {
         const recoveredByLoot = await trySmartAutoLoot();
         if (recoveredByLoot === true) continue;
         if (recoveredByLoot === 'hold') return;
         pushLog('warning', `Stamina is below ${AUTO_LOOT_STAMINA_TRIGGER} and EXP is inside the Auto Loot window; eligible loot did not restore stamina, and potion use remains blocked.`);
+        return;
+      }
+      if (!lootThreshold.eligible && Number.isFinite(lootThreshold.remainingExp) && stamina < AUTO_LOOT_STAMINA_TRIGGER) {
+        pushLog('stamina', `⚡ Stamina ${Math.max(0, Math.round(stamina))} is below ${AUTO_LOOT_STAMINA_TRIGGER} and EXP is outside the Auto Loot window; using the selected stamina potion.`);
+        if (await useEmergencyPotion('stamina', { fillToMax: true })) continue;
+        pushLog('warning', `Stamina is below ${AUTO_LOOT_STAMINA_TRIGGER}, but the selected stamina potion could not be used.`);
         return;
       }
       if (markTurns(target) > 0) {
@@ -6266,7 +6295,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       if (directUsed) continue;
       const slashModel = getSlashModel(target);
-      if (await useOnePotionForPreferredSlash(target, damage, currentStamina(), lootThreshold)) continue;
+      if (await usePotionForHigherSlash(target, damage, currentStamina(), lootThreshold)) continue;
       const slash = slashModel.choose({
         remainingDamage: target.damageLimit - damage,
         damageLimit: target.damageLimit,
@@ -6380,12 +6409,16 @@ async function aurelixGetUpdateStatus(force = false) {
     state.failedLoadoutAt.clear();
     state.activeLoadout = { equipmentPresetId:null, petPresetId:null, detected:false, checkedAt:0 };
     state.attackInFlight = false;
+    state.staminaPotionAwaitingAction = false;
     invalidateCombatPreflight();
     state.potionInFlight = false;
     state.lootInFlight = false;
     state.dungeonLootSweepPending = false;
     state.dungeonLootSweepPromise = null;
     state.lastDungeonLootSweepAt = 0;
+    state.lastSmartLootAttemptAt = 0;
+    state.dungeonLootRetryAfter = 0;
+    state.lootCandidateRejectedUntil.clear();
   }
   async function start() {
     if (state.status === ENGINE_STATES.RUNNING || state.status === ENGINE_STATES.STARTING) {
@@ -6599,7 +6632,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const VERSION = '0.5.62';
+  const VERSION = '0.5.67';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
@@ -6754,7 +6787,6 @@ async function aurelixGetUpdateStatus(force = false) {
   #aurelix-ui[data-theme="emerald"] { --ax-root-bg: linear-gradient(145deg, #051c14 0%, #020b08 100%); --ax-cyan: #34d399; --ax-blue: #10b981; }
   #aurelix-ui[data-theme="nova"] { --ax-root-bg: linear-gradient(145deg, #1a0810 0%, #0d0307 100%); --ax-cyan: #fb7185; --ax-blue: #e11d48; }
 
-  /* NEW THEMES */
   #aurelix-ui[data-theme="cyberpunk"] {
     --ax-bg:#0d0208; --ax-bg-2:#1a0b1c; --ax-panel:rgba(20,5,25,.90); --ax-panel-soft:rgba(30,10,40,.78);
     --ax-cyan:#00ffcc; --ax-blue:#ff00ff; --ax-violet:#bc13fe; --ax-gold:#fcee0a;
@@ -6834,7 +6866,6 @@ async function aurelixGetUpdateStatus(force = false) {
   /* Overview Specific */
   #aurelix-ui .ax-overview { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 16px; }
 
-  /* UPDATED: Larger Target Image Layout */
   #aurelix-ui .ax-target-body { display: grid; grid-template-columns: 220px minmax(0,1fr); gap: 20px; padding: 20px; align-items: center; }
   #aurelix-ui .ax-monster-image-wrap { position: relative; border-radius: 12px; overflow: hidden; border: 1px solid var(--ax-line-strong); background: radial-gradient(circle at center, rgba(67,216,255,.05), rgba(0,0,0,0.5)); aspect-ratio: 1; display: grid; place-items: center; box-shadow: inset 0 0 20px rgba(0,0,0,0.8), 0 4px 15px rgba(0,0,0,0.3); }
   #aurelix-ui .ax-monster-image { width: 100%; height: 100%; object-fit: cover; display: none; }
@@ -7045,7 +7076,6 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   `;
 
-  // --- HTML & JAVASCRIPT LOGIC REMAINS EXACTLY AS ORIGINAL ---
   const host = document.createElement('div');
   host.id = 'aurelix-host';
   host.style.all = 'initial';
@@ -8252,7 +8282,9 @@ async function aurelixGetUpdateStatus(force = false) {
     if (subview) {
       const name = subview.dataset.presetSubview;
       $$('[data-preset-subview]').forEach(button => button.classList.toggle('active', button === subview));
-      $$('[data-preset-panel]').forEach(panel => panel.style.display = panel.dataset.presetPanel === name ? 'block' : 'none');
+      $$('[data-preset-panel]').forEach(panel => {
+        panel.style.display = panel.dataset.presetPanel === name ? 'block' : 'none';
+      });
       return;
     }
 
@@ -8631,10 +8663,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       : 'STABLE';
 
 
-  /* -------------------------
-     CHANGELOG
-     ------------------------- */
-
   if (Array.isArray(release.changelog) && release.changelog.length) {
     changelog.innerHTML = '';
 
@@ -8654,10 +8682,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
     `;
   }
 
-
-  /* -------------------------
-     RELEASE INFORMATION
-     ------------------------- */
 
   if (release.version) {
     const parts = [];
@@ -8679,10 +8703,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       'Release information will appear after checking for updates.';
   }
 
-
-  /* -------------------------
-     STATUS
-     ------------------------- */
 
   switch (state.status) {
 
@@ -8758,7 +8778,7 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       break;
 
 
-    case 'error':
+    case 'error': {
       badge.textContent = 'CHECK FAILED';
 
       status.innerHTML = `
@@ -8786,6 +8806,7 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
 
       installButton.disabled = true;
       break;
+    }
 
 
     default:
@@ -8814,10 +8835,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
 }
 
 
-/* -------------------------
-   CHECK UPDATE
-   ------------------------- */
-
 $('#ax-update-check')?.addEventListener('click', async () => {
 
   AURELIX_UPDATE_STATE.status = 'checking';
@@ -8841,10 +8858,6 @@ $('#ax-update-check')?.addEventListener('click', async () => {
     );
   }
 });
-/* -------------------------
-   INSTALL UPDATE
-   ------------------------- */
-
 $('#ax-update-install')?.addEventListener('click', () => {
   const state = AURELIX_UPDATE_STATE;
 
@@ -8896,7 +8909,6 @@ $('#ax-update-install')?.addEventListener('click', () => {
   }
 });
 
-/* Initial Update Center state */
 renderAurelixUpdateCenter();
 
   const syncThreshold = value => {
