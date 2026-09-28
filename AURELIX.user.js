@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.5.67
+// @version      0.5.72
 // @description  AURELIX automation engine with smart combat, presets, resource recovery, auto loot, and adaptive targeting.
 // @icon         https://raw.githubusercontent.com/cosmic451/afb-assets/main/aurelixauto.png
 // @match        https://demonicscans.org/*
@@ -20,7 +20,7 @@
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.5.67',
+  currentVersion: '0.5.72',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -494,6 +494,7 @@ async function aurelixGetUpdateStatus(force = false) {
       return urlLike;
     }
   }
+  const TRANSIENT_SCAN_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
   async function getPage(urlLike, purpose = 'scan', options = {}) {
     const url = safeUrl(urlLike);
     if (!url || !sameOrigin(url)) throw new Error(`Refusing non-same-origin URL: ${urlLike}`);
@@ -516,9 +517,15 @@ async function aurelixGetUpdateStatus(force = false) {
           'Accept': 'text/html,application/xhtml+xml'
         }
       });
-      const res = options.cookieOverrides
-        ? await withCookieOverrides(options.cookieOverrides, request)
-        : await request();
+      let res;
+      for (let attempt = 0; ; attempt += 1) {
+        res = options.cookieOverrides
+          ? await withCookieOverrides(options.cookieOverrides, request)
+          : await request();
+        if (attempt >= 2 || !TRANSIENT_SCAN_STATUSES.has(Number(res.status))) break;
+        try { await res.body?.cancel?.(); } catch (_) {}
+        await sleep(attempt === 0 ? 500 : 1200);
+      }
       const html = await res.text();
       const doc = parseHtml(html);
       const rec = {
@@ -1077,7 +1084,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const remainingWaveSlots = Math.max(0, CONFIG.maxGatePages - processedWaves.size);
       const waveBatch = [...waveMap.values()]
         .filter(w => !processedWaves.has(`${w.gateId}:${w.waveId}`))
-        .slice(0, Math.min(3, remainingWaveSlots));
+        .slice(0, Math.min(6, remainingWaveSlots));
       if (waveBatch.length) {
         // Bounded parallelism: live timing diagnostics showed sequential Gate-wave GETs
         // dominate scan duration. Three concurrent reads materially reduce wall-clock time
@@ -1607,7 +1614,7 @@ async function aurelixGetUpdateStatus(force = false) {
     const dungeons = [];
     const locations = [];
     const entities = [];
-    for (const seed of instances) {
+    await mapWithConcurrency(instances, 2, async seed => {
       try {
         const page = await getPage(seed.url, `dungeon-entry:${seed.instanceId}`);
         const finalPath = new URL(page.finalUrl).pathname;
@@ -1619,7 +1626,7 @@ async function aurelixGetUpdateStatus(force = false) {
           const cubeResult = await scanCubeDungeon(page, seed, cube);
           locations.push(...cubeResult.locations);
           entities.push(...cubeResult.entities);
-          continue;
+          return;
         }
         const dungeon = parseDungeonInstance(page.doc, page.finalUrl, seed.instanceId);
         dungeon.implementation = /guild_dungeon_instance\.php$/i.test(finalPath) ? 'standard' : 'special-html';
@@ -1653,7 +1660,7 @@ async function aurelixGetUpdateStatus(force = false) {
       } catch (e) {
         state.errors.push({ at: nowIso(), stage: 'dungeon-instance', instanceId: seed.instanceId, message: String(e?.message || e) });
       }
-    }
+    });
     return { dungeons, locations, entities };
   }
   async function scanGates(rootPage, extraBootstrapPages = []) {
@@ -1990,7 +1997,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.5.67';
+  const ENGINE_VERSION = '0.5.72';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -2447,8 +2454,12 @@ async function aurelixGetUpdateStatus(force = false) {
     activeLoadout: { equipmentPresetId: null, petPresetId: null, detected: false, checkedAt: 0 },
     loadoutInFlight: false,
     loadoutPromise: null,
+    loadoutDetectionPromise: null,
+    loadoutSnapshotCache: { equipment:null, pets:null, checkedAt:0 },
     failedLoadoutGroups: new Set(),
     failedLoadoutAt: new Map(),
+    deadBuffRelayUntil: new Map(),
+    deadCombatTargetsUntil: new Map(),
     skillCatalog: mergedPersistedSection('skillCatalog', ENGINE_STORE.skillCatalog),
     session: {
       id: null,
@@ -2500,6 +2511,8 @@ async function aurelixGetUpdateStatus(force = false) {
     skillDamageModels: new Map(),
     skillDiscoveryPromise: null,
     skillDiscoveryAt: 0,
+    consecutiveNetworkFailures: 0,
+    lastNetworkWarningAt: 0,
     directSkillCursor: 0,
     markTurnsByEncounter: {},
     markTotalByEncounter: {},
@@ -2511,7 +2524,9 @@ async function aurelixGetUpdateStatus(force = false) {
   if (window.AURELIX?.subscribe) {
     unsubscribeScanner = window.AURELIX.subscribe(event => {
       if (event.type === 'scan-complete') {
-        void refreshActiveSkills(Object.keys(state.skillCatalog).length === 0);
+        if (state.status !== ENGINE_STATES.RUNNING && Object.keys(state.skillCatalog).length === 0) {
+          void refreshActiveSkills(true);
+        }
         if (state.status === ENGINE_STATES.RUNNING) {
           state.dungeonLootSweepPending = state.settings.autoLoot !== false;
           if (!state.loadoutInFlight) decideNow();
@@ -3078,6 +3093,9 @@ async function aurelixGetUpdateStatus(force = false) {
       const phaseLimits = phasePolicyLimits(policy, entity.name, policyKey);
       if (!(phaseLimits.phase1 > 0 || phaseLimits.phase3 > 0)) continue;
       const encounterKey = runtimeEncounterKey(entity);
+      const deadUntil = Number(state.deadCombatTargetsUntil.get(encounterKey)) || 0;
+      if (deadUntil > Date.now()) continue;
+      if (deadUntil) state.deadCombatTargetsUntil.delete(encounterKey);
       const ledgerDamage = Number(state.encounterLedger[encounterKey]?.damage);
       const scannedDamage = Number(entity.userDamage);
       const knownValues = [scannedDamage, ledgerDamage].filter(v => Number.isFinite(v) && v >= 0);
@@ -3273,28 +3291,58 @@ async function aurelixGetUpdateStatus(force = false) {
     const n = Number(match[0]);
     return Number.isFinite(n) ? n : null;
   }
+  const TRANSIENT_SERVER_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+  function isTransientServerStatus(status) {
+    return TRANSIENT_SERVER_STATUSES.has(Number(status));
+  }
+  const NETWORK_GET_TIMEOUT_MS = 6_000;
+  const NETWORK_POST_TIMEOUT_MS = 8_000;
   async function fetchText(url, options = {}) {
     const resolvedUrl = new URL(url, location.origin);
     if (resolvedUrl.origin !== location.origin) throw new Error(`Refusing cross-origin combat request: ${resolvedUrl.origin}`);
     const externalSignal = options.signal || null;
-    const controller = new AbortController();
-    const abortFromExternal = () => controller.abort(externalSignal?.reason);
-    if (externalSignal?.aborted) abortFromExternal();
-    else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
-    const timeout = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), 15_000);
-    try {
-      const { signal: _ignoredSignal, ...requestOptions } = options;
-      const res = await fetch(resolvedUrl.href, {
-        credentials: 'include',
-        cache: options.method && String(options.method).toUpperCase() !== 'GET' ? 'default' : 'no-store',
-        ...requestOptions,
-        signal: controller.signal
-      });
-      const text = await res.text();
-      return { res, text };
-    } finally {
-      clearTimeout(timeout);
-      externalSignal?.removeEventListener?.('abort', abortFromExternal);
+    const method = String(options.method || 'GET').toUpperCase();
+    const requestedTimeout = Number(options.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeout)
+      ? Math.max(2_000, Math.min(15_000, requestedTimeout))
+      : (method === 'GET' ? NETWORK_GET_TIMEOUT_MS : NETWORK_POST_TIMEOUT_MS);
+    const requestedRetries = Number(options.safeRetries);
+    const safeRetries = method === 'GET'
+      ? (Number.isFinite(requestedRetries) ? Math.max(0, Math.min(1, requestedRetries)) : 1)
+      : 0;
+    for (let attempt = 0; ; attempt += 1) {
+      const controller = new AbortController();
+      const abortFromExternal = () => controller.abort(externalSignal?.reason);
+      if (externalSignal?.aborted) abortFromExternal();
+      else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
+      const timeout = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
+      try {
+        const {
+          signal: _ignoredSignal,
+          timeoutMs: _ignoredTimeout,
+          safeRetries: _ignoredRetries,
+          ...requestOptions
+        } = options;
+        const res = await fetch(resolvedUrl.href, {
+          credentials: 'include',
+          cache: method === 'GET' ? 'no-store' : 'default',
+          ...requestOptions,
+          signal: controller.signal
+        });
+        const text = await res.text();
+        if (attempt < safeRetries && isTransientServerStatus(res.status)) {
+          await sleep(250, externalSignal);
+          continue;
+        }
+        return { res, text };
+      } catch (error) {
+        if (externalSignal?.aborted) throw error;
+        if (controller.signal.aborted) throw new Error(`Network request timed out after ${Math.round(timeoutMs / 1000)}s`);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        externalSignal?.removeEventListener?.('abort', abortFromExternal);
+      }
     }
   }
   const LOADOUT_LEGACY = Object.freeze({
@@ -3305,7 +3353,7 @@ async function aurelixGetUpdateStatus(force = false) {
   const LOADOUT_SLOT_BY_ID = Object.freeze(Object.fromEntries(Object.entries(LOADOUT_SLOTS).map(([key, value]) => [String(value), key])));
   const LOADOUT_VERIFY_TTL_MS = 10 * 60_000;
   const loadoutSignal = () => [ENGINE_STATES.RUNNING, ENGINE_STATES.STARTING].includes(state.status) ? state.abortController?.signal : null;
-  const loadoutSleep = ms => sleep(ms, loadoutSignal());
+  const loadoutSleep = ms => sleep(Math.min(10, Math.max(0, Number(ms) || 0)), loadoutSignal());
   function normalizeAssetPath(src) {
     if (!src) return '';
     try { return new URL(src, location.href).pathname.replace(/^\//, ''); }
@@ -3417,7 +3465,12 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   async function loadoutRequest(url, { method='GET', params=null, expect='auto' } = {}) {
     let target = url;
-    const options = { method, signal:loadoutSignal() };
+    const options = {
+      method,
+      signal:loadoutSignal(),
+      timeoutMs:String(method).toUpperCase() === 'GET' ? 7_000 : 8_000,
+      safeRetries:String(method).toUpperCase() === 'GET' ? 1 : 0
+    };
     if (String(method).toUpperCase() === 'GET' && params) {
       const query = new URLSearchParams();
       Object.entries(params).forEach(([k,v]) => { if (v != null) query.set(k, String(v)); });
@@ -3558,9 +3611,9 @@ async function aurelixGetUpdateStatus(force = false) {
     return clone(preset);
   }
   async function equipmentPost(data) { return loadoutRequest('/inventory_ajax.php', { method:'POST', params:data, expect:'text' }); }
-  async function applyEquipmentPreset(preset) {
+  async function applyEquipmentPreset(preset, initialCurrent = null, { verify = true } = {}) {
     if (!normalizeEquipmentPreset(preset)) throw new Error('Invalid PvE equipment preset.');
-    const current = await fetchEquipmentSnapshot();
+    const current = initialCurrent || await fetchEquipmentSnapshot();
     if (equipmentPresetMatches(preset, current)) return 0;
     const desired = preset.equipment || {};
     const cards = current._crystalCards || [];
@@ -3593,7 +3646,7 @@ async function aurelixGetUpdateStatus(force = false) {
       await loadoutRequest('/power_crystals.php', { method:'POST', params:{ action:'equip_crystal', crystal_id:crystal.id, equipment_inv_id:item.invId }, expect:'text' });
       changed++; await loadoutSleep(40);
     }
-    if (!equipmentPresetMatches(preset, await fetchEquipmentSnapshot())) throw new Error('Equipment and crystal verification failed.');
+    if (verify && !equipmentPresetMatches(preset, await fetchEquipmentSnapshot())) throw new Error('Equipment and crystal verification failed.');
     return changed;
   }
   function petRecordFromCard(id, name, image) {
@@ -3791,10 +3844,10 @@ async function aurelixGetUpdateStatus(force = false) {
     data.links.push({ link_level:level, inv_id:String(linkedId) });
     return true;
   }
-  async function applyPetPreset(preset) {
+  async function applyPetPreset(preset, initialCurrent = null, { verify = true } = {}) {
     if (!normalizePetPreset(preset)) throw new Error('Invalid PvE pet preset.');
     validatePetFormation(preset);
-    const current = await fetchPetSnapshot();
+    const current = initialCurrent || await fetchPetSnapshot();
     if (petPresetMatches(preset, current)) return 0;
     const desiredMainIds = new Set(), desiredLinkUsage = new Map();
     for (let slot=1; slot<=3; slot++) {
@@ -3846,7 +3899,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const data = desiredStateById.get(String(cfg.main.id));
       for (let level=1; level<=2; level++) if (cfg.links?.[level]?.id && await petLinkKnown(cfg.main.id, level, cfg.links[level].id, data)) { changed++; await loadoutSleep(25); }
     }
-    if (!petPresetMatches(preset, await fetchPetSnapshot())) throw new Error('Pet preset verification failed.');
+    if (verify && !petPresetMatches(preset, await fetchPetSnapshot())) throw new Error('Pet preset verification failed.');
     return changed;
   }
   function resetAllDamageCalibration(reason) {
@@ -3872,8 +3925,34 @@ async function aurelixGetUpdateStatus(force = false) {
           state.activeLoadout.detected = false;
           state.activeLoadout.checkedAt = 0;
         }
-        if (equipment) { pushLog('system', `Checking equipment preset “${equipment.name}”…`); changed += await applyEquipmentPreset(equipment); }
-        if (pets) { pushLog('system', `Checking pet preset “${pets.name}”…`); changed += await applyPetPreset(pets); }
+        const cachedSnapshot = !manual && Date.now() - Number(state.loadoutSnapshotCache.checkedAt || 0) < 5000
+          ? state.loadoutSnapshotCache
+          : null;
+        const [equipmentSnapshot, petSnapshot] = await Promise.all([
+          equipment ? (cachedSnapshot?.equipment || fetchEquipmentSnapshot()) : Promise.resolve(null),
+          pets ? (cachedSnapshot?.pets || fetchPetSnapshot()) : Promise.resolve(null)
+        ]);
+        const equipmentMatched = !equipment || equipmentPresetMatches(equipment, equipmentSnapshot);
+        const petsMatched = !pets || petPresetMatches(pets, petSnapshot);
+        if (equipment && !equipmentMatched) {
+          pushLog('system', `Applying equipment preset “${equipment.name}”…`);
+          changed += await applyEquipmentPreset(equipment, equipmentSnapshot, { verify:false });
+        }
+        if (pets && !petsMatched) {
+          pushLog('system', `Applying pet preset “${pets.name}”…`);
+          changed += await applyPetPreset(pets, petSnapshot, { verify:false });
+        }
+        if (!equipmentMatched || !petsMatched) {
+          const [verifiedEquipment, verifiedPets] = await Promise.all([
+            equipment && !equipmentMatched ? fetchEquipmentSnapshot() : Promise.resolve(equipmentSnapshot),
+            pets && !petsMatched ? fetchPetSnapshot() : Promise.resolve(petSnapshot)
+          ]);
+          if (equipment && !equipmentPresetMatches(equipment, verifiedEquipment)) throw new Error('Equipment and crystal verification failed.');
+          if (pets && !petPresetMatches(pets, verifiedPets)) throw new Error('Pet preset verification failed.');
+          state.loadoutSnapshotCache = { equipment:verifiedEquipment, pets:verifiedPets, checkedAt:Date.now() };
+        } else {
+          state.loadoutSnapshotCache = { equipment:equipmentSnapshot, pets:petSnapshot, checkedAt:Date.now() };
+        }
         if (normalized.equipmentPresetId) state.activeLoadout.equipmentPresetId = normalized.equipmentPresetId;
         if (normalized.petPresetId) state.activeLoadout.petPresetId = normalized.petPresetId;
         state.activeLoadout.detected = true; state.activeLoadout.checkedAt = Date.now();
@@ -3887,6 +3966,7 @@ async function aurelixGetUpdateStatus(force = false) {
         return { ok:true, changed };
       } catch (error) {
         state.activeLoadout = { equipmentPresetId:null, petPresetId:null, detected:false, checkedAt:0 };
+        state.loadoutSnapshotCache = { equipment:null, pets:null, checkedAt:0 };
         throw error;
       } finally { state.loadoutInFlight = false; state.loadoutPromise = null; emit(); }
     })();
@@ -3897,31 +3977,47 @@ async function aurelixGetUpdateStatus(force = false) {
     const groupKey = loadoutGroupKey(assignment);
     if (loadoutGroupBlocked(groupKey)) return false;
     const requiresPreset = !!(assignment.equipmentPresetId || assignment.petPresetId);
-    const detectionFresh = state.activeLoadout.detected && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS;
     if (!requiresPreset) return true;
+    if (state.loadoutDetectionPromise) {
+      try { await state.loadoutDetectionPromise; }
+      catch (error) { if (error?.name === 'AbortError') throw error; }
+    }
+    const detectionFresh = state.activeLoadout.detected && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS;
     if (target?.phaseWaiting && state.activeLoadout.detected && activeLoadoutMatches(assignment)) return true;
     if (detectionFresh && activeLoadoutMatches(assignment)) return true;
     try { await applyLoadoutAssignment(assignment); return true; }
     catch (error) {
       if (error?.name === 'AbortError') throw error;
       state.failedLoadoutGroups.add(groupKey);
-      state.failedLoadoutAt.set(groupKey, Date.now());
+      const isNetworkFailure = /timed?\s*out|network|failed\s+to\s+fetch|load\s+failed/i.test(String(error?.message || error));
+      state.failedLoadoutAt.set(
+        groupKey,
+        isNetworkFailure ? Date.now() - (LOADOUT_FAILURE_RETRY_MS - 5_000) : Date.now()
+      );
       state.session.stats.errors += 1;
-      pushLog('error', `Loadout group skipped for ${target?.name || 'target'}: ${error?.message || error}`);
+      pushLog(
+        isNetworkFailure ? 'warning' : 'error',
+        `Loadout group skipped for ${target?.name || 'target'}: ${error?.message || error}${isNetworkFailure ? ' (network retry in 5s)' : ''}`
+      );
       decideNow();
       return false;
     }
   }
   async function detectActiveLoadout() {
     if (state.loadoutInFlight) return clone(state.activeLoadout);
-    const [equipment, pets] = await Promise.all([fetchEquipmentSnapshot(), fetchPetSnapshot()]);
-    state.activeLoadout = {
-      equipmentPresetId:state.equipmentPresets.find(p => equipmentPresetMatches(p, equipment))?.id || null,
-      petPresetId:state.petPresets.find(p => petPresetMatches(p, pets))?.id || null,
-      detected:true, checkedAt:Date.now()
-    };
-    emit();
-    return clone(state.activeLoadout);
+    if (state.loadoutDetectionPromise) return state.loadoutDetectionPromise;
+    state.loadoutDetectionPromise = (async () => {
+      const [equipment, pets] = await Promise.all([fetchEquipmentSnapshot(), fetchPetSnapshot()]);
+      state.loadoutSnapshotCache = { equipment, pets, checkedAt:Date.now() };
+      state.activeLoadout = {
+        equipmentPresetId:state.equipmentPresets.find(p => equipmentPresetMatches(p, equipment))?.id || null,
+        petPresetId:state.petPresets.find(p => petPresetMatches(p, pets))?.id || null,
+        detected:true, checkedAt:Date.now()
+      };
+      emit();
+      return clone(state.activeLoadout);
+    })().finally(() => { state.loadoutDetectionPromise = null; });
+    return state.loadoutDetectionPromise;
   }
   function renameLoadoutPreset(kind, id, name) {
     const list = kind === 'equipment' ? state.equipmentPresets : state.petPresets;
@@ -4153,6 +4249,8 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!target || target.source !== 'gate') return null;
     const entities = window.AURELIX?.getReport?.()?.entities;
     if (!Array.isArray(entities)) return null;
+    const now = Date.now();
+    for (const [key, until] of state.deadBuffRelayUntil) if (!(Number(until) > now)) state.deadBuffRelayUntil.delete(key);
     const candidates = entities.filter(entity =>
       entity &&
       entity.source === 'gate' &&
@@ -4163,6 +4261,7 @@ async function aurelixGetUpdateStatus(force = false) {
       Number(entity.runtimeId ?? entity.monsterId) !== Number(target.runtimeId ?? target.monsterId) &&
       !entity.specialType &&
       !entity.classifiedByTimer &&
+      !(Number(state.deadBuffRelayUntil.get(runtimeEncounterKey(entity))) > now) &&
       (entity.battleUrl || entity.runtimeId || entity.monsterId)
     );
     candidates.sort((a, b) => (Number(b.currentHp) || 0) - (Number(a.currentHp) || 0));
@@ -4256,9 +4355,7 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     if (snapshot.joinRequired) {
       if (!await joinTarget(carrier, snapshot)) return { ok: true, skippedBuff: true };
-      await sleep(200);
-      snapshot = await fetchBattleSnapshot(carrier);
-      if (!snapshot.ok || !snapshot.identityOk) return { ok: true, skippedBuff: true };
+      snapshot = { ...snapshot, joinRequired:false };
     }
     const beforeStamina = Number(currentStamina());
     const body = new URLSearchParams();
@@ -4276,10 +4373,21 @@ async function aurelixGetUpdateStatus(force = false) {
       await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2000);
       return { ok: true, cooldownOnly: true };
     }
+    if (isTransientServerStatus(res.status)) {
+      pushLog('warning', `${skill.name}: server returned HTTP ${res.status} during buff relay; waiting briefly before safe re-evaluation.`);
+      await sleep(750);
+      return { ok: true, cooldownOnly: true, uncertain: true };
+    }
     let data = null;
     try { data = JSON.parse(text); } catch (_) {}
     const message = normalizeSpace(data?.message || data?.error || text);
     if (!res.ok || !data || (data.status && data.status !== 'success')) {
+      if (/already\s*dead|monster\s*is\s*already\s*dead/i.test(message)) {
+        state.deadBuffRelayUntil.set(runtimeEncounterKey(carrier), Date.now() + 120_000);
+        pushLog('skill', `${carrier.name} is dead; switching ${skill.name} immediately to another live relay mob.`);
+        await sleep(state.settings.attackCooldownMs);
+        return { ok: true, cooldownOnly: true, deadCarrier: true };
+      }
       pushLog('warning', `${skill.name} buff relay rejected on ${carrier.name}: ${message || `HTTP ${res.status}`}`);
       return { ok: true, skippedBuff: true };
     }
@@ -4486,7 +4594,7 @@ async function aurelixGetUpdateStatus(force = false) {
     const key = runtimeEncounterKey(target);
     const cache = state.combatPreflight;
     const age = Date.now() - Number(cache.fetchedAt || 0);
-    const reusable = !forceFresh && cache.key === key && cache.snapshot?.ok && cache.snapshot?.identityOk && age < 2500 && Number(cache.actionsSinceFresh || 0) < 5;
+    const reusable = !forceFresh && cache.key === key && cache.snapshot?.ok && cache.snapshot?.identityOk && age < 8000 && Number(cache.actionsSinceFresh || 0) < 20;
     if (reusable) return cache.snapshot;
     const snapshot = await fetchBattleSnapshot(target);
     if (snapshot?.ok && snapshot?.identityOk) {
@@ -4584,6 +4692,16 @@ async function aurelixGetUpdateStatus(force = false) {
       body: body.toString(),
       signal: state.abortController?.signal
     });
+    if (isTransientServerStatus(res.status)) {
+      pushLog('warning', `Join result for ${target.name} is uncertain after HTTP ${res.status}; verifying battle state.`);
+      await sleep(500);
+      const verified = await fetchBattleSnapshot(target);
+      if (verified.ok && verified.identityOk && !verified.joinRequired) {
+        pushLog('combat', `Joined ${target.name} (verified after server recovery).`);
+        return true;
+      }
+      return false;
+    }
     const msg = normalizeSpace(text);
     const ok = res.ok && (/^you have successfully/i.test(msg) || /already\s+joined/i.test(msg));
     if (ok) pushLog('combat', `Joined ${target.name}.`);
@@ -4663,7 +4781,7 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     if (snapshot.joinRequired) {
       if (!await joinTarget(target, snapshot)) return { ok: false, reason: 'phase3-join-failed' };
-      await sleep(200);
+      await sleep(40);
       invalidateCombatPreflight(target);
       snapshot = await combatPreflight(target, true);
       if (!snapshot.ok || !snapshot.identityOk) {
@@ -4932,7 +5050,12 @@ async function aurelixGetUpdateStatus(force = false) {
         if (Number.isFinite(hp)) state.liveResources.hp = hp;
         if (Number.isFinite(mana)) state.liveResources.mana = mana;
       }
-      await refreshLiveResourcesAfterPotion();
+      const potionStateConfirmed = kind === 'stamina'
+        ? Number.isFinite(parseNumber(data?.stamina ?? data?.current_stamina))
+        : kind === 'mana'
+          ? Number.isFinite(parseNumber(data?.mana ?? data?.current_mana))
+          : Number.isFinite(parseNumber(data?.hp ?? data?.current_hp ?? data?.user_hp_after));
+      if (!potionStateConfirmed) await refreshLiveResourcesAfterPotion();
       if (consumed > 0) {
         if (kind === 'mana') {
           const after = Number(currentMana());
@@ -4950,7 +5073,7 @@ async function aurelixGetUpdateStatus(force = false) {
           }
         }
       }
-      if (kind === 'hp') await sleep(250);
+      if (kind === 'hp' && !potionStateConfirmed) await sleep(100);
       if (kind === 'hp' && !(Number(state.liveResources.hp) > 0)) {
         try {
           const target = state.currentTarget;
@@ -4984,7 +5107,6 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       if (kind === 'hp') pushLog('hp', `HP recovery confirmed (${Math.round(Number(state.liveResources.hp) || 1).toLocaleString()} HP). Resuming combat.`);
       emit();
-      await sleep(120);
       return true;
     } finally {
       state.potionInFlight = false;
@@ -5052,6 +5174,18 @@ async function aurelixGetUpdateStatus(force = false) {
     const text = normalizeSpace(card.textContent || '');
     return /\bjoined\b/i.test(text) && !/\bnot\s+joined\b/i.test(text);
   }
+  function lootCardExplicitlyUnjoined(card) {
+    if (!card) return false;
+    const joined = String(card.dataset?.joined || '').toLowerCase();
+    if (String(card.dataset?.unjoined || '') === '1' || joined === '0' || joined === 'false') return true;
+    return /\bnot\s+joined\b/i.test(normalizeSpace(card.textContent || ''));
+  }
+  function lootCardIsBoss(card) {
+    if (!card) return false;
+    return card.matches?.('.boss-card,.dungeon-boss,[data-boss-id],[data-boss_id]') ||
+      !!card.querySelector?.('[data-boss-id],[data-boss_id],.boss-card,.dungeon-boss') ||
+      /\bboss\b/i.test(String(card.className || ''));
+  }
   function lootCardLooksDead(card) {
     if (!card) return false;
     if (String(card.dataset?.dead || '') === '1' || card.classList?.contains('dead')) return true;
@@ -5072,9 +5206,8 @@ async function aurelixGetUpdateStatus(force = false) {
     return value || 'Monster';
   }
   function dungeonLootCandidateFromCard(card, loc) {
-    // Boss cards do not consistently render a joined badge. The battle-page
-    // verifier remains the authority before any loot claim is attempted.
-    if (!lootCardLooksDead(card) || !lootCardLooksUnclaimed(card)) return null;
+    if (!lootCardLooksDead(card) || !lootCardLooksUnclaimed(card) || lootCardExplicitlyUnjoined(card)) return null;
+    if (!lootCardLooksJoined(card) && !lootCardIsBoss(card)) return null;
     const links = [...card.querySelectorAll('a[href],button[data-dgmid],button[data-monster-id],button[data-boss-id],[data-dgmid],[data-monster-id],[data-boss-id]')];
     let dgmid = parseNumber(card.dataset?.dgmid ?? card.dataset?.monsterId ?? card.dataset?.monster_id ?? card.dataset?.bossId ?? card.dataset?.boss_id);
     let instanceId = parseNumber(card.dataset?.instanceId ?? card.dataset?.instance_id) ?? parseNumber(loc.instanceId);
@@ -5333,7 +5466,6 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!verified) {
       const retryAt = Date.now() + LOOT_REJECT_COOLDOWN_MS;
       state.lootCandidateRejectedUntil.set(candidate.key, retryAt);
-      pushLog('loot', `AUTO LOOT — skipped ${candidate.source} ${candidate.name}: fresh battle page did not confirm joined + dead + unclaimed loot; retry paused for 2 minutes.`);
       return { ok: false, reason: 'not-lootable' };
     }
     const body = new URLSearchParams();
@@ -5376,7 +5508,9 @@ async function aurelixGetUpdateStatus(force = false) {
     state.session.stats.xpLooted += expGained;
     state.session.stats.mobsLooted += 1;
     state.session.stats.mobsUnlooted = Math.max(0, Number(state.session.stats.mobsUnlooted || 0) - 1);
-    pushLog('loot', `🎁 AUTO LOOT — ${candidate.source === 'dungeon' ? 'Dungeon' : 'Gate'}: ${candidate.name}${expGained > 0 ? ` (+${Math.round(expGained).toLocaleString()} EXP)` : ''}.`);
+    pushLog('loot', candidate.source === 'dungeon'
+      ? `🎁 AUTO LOOT — Dungeon Monster: ${candidate.name} — ${Math.round(expGained).toLocaleString()} EXP gained.`
+      : `🎁 AUTO LOOT — Gate: ${candidate.name}${expGained > 0 ? ` (+${Math.round(expGained).toLocaleString()} EXP)` : ''}.`);
     emit();
     return { ok: true, expGained };
   }
@@ -5435,6 +5569,7 @@ async function aurelixGetUpdateStatus(force = false) {
     state.lootInFlight = true;
     state.lastDungeonLootSweepAt = now;
     try {
+      pushLog('loot', 'AUTO LOOT — Dungeon instances checking for available loot…');
       const discovered = await discoverDungeonLootCandidates();
       const checkedAt = Date.now();
       const dungeonCandidates = discovered.filter(candidate => !(Number(state.lootCandidateRejectedUntil.get(candidate.key)) > checkedAt));
@@ -5446,8 +5581,6 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       const fresh = await fetchFreshPlayerState();
       const initialLevel = Number(fresh?.level) || null;
-      pushLog('loot', 'AUTO LOOT — Dungeon priority sweep.');
-      pushLog('loot', `AUTO LOOT — ${dungeonCandidates.length} dead + unclaimed Dungeon candidate${dungeonCandidates.length === 1 ? '' : 's'} found; verifying and claiming Dungeon loot first.`);
       // Dungeon bosses are explicit priority loot: never reserve one of them.
       // The emergency reserve is maintained by the Gate/Wave loot pool instead.
       const result = await processLootCandidates(dungeonCandidates, { stopOnRecovery, initialLevel, initialStamina:fresh?.stamina, reserveOne:false });
@@ -5644,7 +5777,7 @@ async function aurelixGetUpdateStatus(force = false) {
           const pick = normalFirst[Math.floor(Math.random() * Math.min(3, normalFirst.length))] || normalFirst[0];
           try {
             if (await joinDiscoveryBattleWithoutAttack(pick.candidate, pick.doc)) {
-              await sleep(120);
+              await sleep(40);
               const { res, text } = await fetchText(pick.candidate.url, { signal: state.abortController?.signal });
               if (res.ok) {
                 const discovered = updateSkillCatalogFromDocument(docFromHtml(text));
@@ -5708,7 +5841,6 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     const used = await useEmergencyPotion('mana', { fillToMax: true });
     if (!used) return false;
-    await sleep(120);
     mana = currentMana();
     return Number.isFinite(Number(mana)) && Number(mana) >= required;
   }
@@ -5778,6 +5910,16 @@ async function aurelixGetUpdateStatus(force = false) {
         await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2000);
         return { ok: true, cooldownOnly: true, damage: damageBefore };
       }
+      if (isTransientServerStatus(res.status)) {
+        invalidateCombatPreflight(target);
+        pushLog('warning', `${skill.name} returned HTTP ${res.status}; verifying combat state before any retry.`);
+        if (skill.behavior === 'direct') {
+          const resolved = await resolveUncertainAttack(target, damageBefore);
+          return { ok: resolved.resolved, uncertain: true, damage: resolved.damage, reason: resolved.resolved ? null : 'transient-server-error' };
+        }
+        await sleep(750);
+        return { ok: true, cooldownOnly: true, uncertain: true, damage: damageBefore };
+      }
       let data = null;
       try { data = JSON.parse(text); } catch (_) {}
       const message = normalizeSpace(data?.message || data?.error || text);
@@ -5785,7 +5927,6 @@ async function aurelixGetUpdateStatus(force = false) {
         if (/not enough mana/i.test(message)) {
           const manaNow = currentMana();
           if (allowManaRetry && manaPotionTriggerReached(manaNow) && await useEmergencyPotion('mana', { fillToMax: true })) {
-            await sleep(120);
             pushLog('mana', `Mana recovered for ${skill.name}; retrying on the next combat cycle.`);
             return { ok: true, cooldownOnly: true, damage: damageBefore };
           }
@@ -5801,7 +5942,11 @@ async function aurelixGetUpdateStatus(force = false) {
           await sleep(2000);
           return { ok: true, cooldownOnly: true, damage: damageBefore };
         }
-        if (/already\s*dead|monster\s*is\s*already\s*dead/i.test(message)) return { ok: false, reason: 'dead', damage: damageBefore };
+        if (/already\s*dead|monster\s*is\s*already\s*dead/i.test(message)) {
+          state.deadCombatTargetsUntil.set(runtimeEncounterKey(target), Date.now() + 120_000);
+          invalidateCombatPreflight(target);
+          return { ok: false, reason: 'dead', damage: damageBefore };
+        }
         if (skill.behavior === 'buff' && target.source === 'gate' && /divine|shield|(?:cannot|can't|can not).{0,40}(?:buff|skill)|(?:buff|skill).{0,40}(?:not allowed|blocked|restricted)/i.test(message)) {
           pushLog('skill', `${skill.name} is restricted on ${target.name}; switching to normal-mob buff relay.`);
           return await performRelayedBuff(target, skill, damageBefore);
@@ -6001,6 +6146,12 @@ async function aurelixGetUpdateStatus(force = false) {
         const resolved = await resolveUncertainAttack(target, damageBefore);
         return { ok: resolved.resolved, damage: resolved.damage, reason: resolved.resolved ? null : 'rate-limit' };
       }
+      if (isTransientServerStatus(res.status)) {
+        invalidateCombatPreflight(target);
+        pushLog('warning', `Attack returned HTTP ${res.status}; verifying server damage before any retry.`);
+        const resolved = await resolveUncertainAttack(target, damageBefore);
+        return { ok: resolved.resolved, uncertain: true, damage: resolved.damage, reason: resolved.resolved ? null : 'transient-server-error' };
+      }
       let data = null;
       try { data = JSON.parse(text); } catch (_) {}
       const message = normalizeSpace(data?.message || data?.error || text);
@@ -6014,7 +6165,11 @@ async function aurelixGetUpdateStatus(force = false) {
           await sleep(2000);
           return { ok: true, cooldownOnly: true, damage: damageBefore };
         }
-        if (/already\s*dead|monster\s*is\s*already\s*dead/i.test(message)) return { ok: false, reason: 'dead', damage: damageBefore };
+        if (/already\s*dead|monster\s*is\s*already\s*dead/i.test(message)) {
+          state.deadCombatTargetsUntil.set(runtimeEncounterKey(target), Date.now() + 120_000);
+          invalidateCombatPreflight(target);
+          return { ok: false, reason: 'dead', damage: damageBefore };
+        }
         pushLog('warning', `Attack rejected on ${target.name}: ${message || `HTTP ${res.status}`}`);
         return { ok: false, reason: 'rejected', damage: damageBefore };
       }
@@ -6095,12 +6250,18 @@ async function aurelixGetUpdateStatus(force = false) {
     if (snapshot.joinRequired) {
       const joined = await joinTarget(target, snapshot);
       if (!joined) return;
-      await sleep(200);
-      invalidateCombatPreflight(target);
-      snapshot = await combatPreflight(target, true);
-      if (!snapshot.ok || !snapshot.identityOk) {
-        await reconcileScanner();
-        return;
+      const phaseSensitiveJoin = Number(target.phase3DamageLimit) > 0 || target.phaseWaiting || target.phaseStage === 'phase3';
+      if (phaseSensitiveJoin) {
+        await sleep(40);
+        invalidateCombatPreflight(target);
+        snapshot = await combatPreflight(target, true);
+        if (!snapshot.ok || !snapshot.identityOk) {
+          await reconcileScanner();
+          return;
+        }
+      } else {
+        snapshot = { ...snapshot, joinRequired:false };
+        state.combatPreflight = { key:runtimeEncounterKey(target), snapshot, fetchedAt:Date.now(), actionsSinceFresh:0 };
       }
       if (snapshot.phaseDuel) {
         const phaseResult = await handleMonsterPhase(target, snapshot.phaseDuel);
@@ -6116,7 +6277,7 @@ async function aurelixGetUpdateStatus(force = false) {
         if (snapshot.joinRequired) {
           const phase3Joined = await joinTarget(target, snapshot);
           if (!phase3Joined) return;
-          await sleep(200);
+          await sleep(40);
           invalidateCombatPreflight(target);
           snapshot = await combatPreflight(target, true);
           if (!snapshot.ok || !snapshot.identityOk) {
@@ -6188,7 +6349,7 @@ async function aurelixGetUpdateStatus(force = false) {
         return;
       }
       let lootThreshold = smartLootThresholdState(currentExpState());
-      if (stamina < AUTO_LOOT_STAMINA_TRIGGER) {
+      if (stamina < AUTO_LOOT_STAMINA_TRIGGER && !Number.isFinite(lootThreshold.remainingExp)) {
         const freshDecision = await fetchFreshPlayerState();
         if (freshDecision) {
           stamina = Number.isFinite(Number(freshDecision.stamina)) ? Number(freshDecision.stamina) : stamina;
@@ -6334,7 +6495,8 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       if (result.cooldownOnly) continue;
       if (!result.ok) {
-        if (['stale-target', 'dead'].includes(result.reason)) await reconcileScanner();
+        if (result.reason === 'stale-target') await reconcileScanner();
+        else if (result.reason === 'dead') decideNow();
         return;
       }
       damage = Number.isFinite(Number(result.damage)) ? Number(result.damage) : damage;
@@ -6346,21 +6508,33 @@ async function aurelixGetUpdateStatus(force = false) {
         if (!state.currentTarget) decideNow();
         const target = state.currentTarget ? clone(state.currentTarget) : null;
         if (!target) {
-          await runPendingDungeonLootSweep();
-          await sleep(350);
+          void runPendingDungeonLootSweep();
+          await sleep(75);
           continue;
         }
         await executeCombatTarget(target);
+        state.consecutiveNetworkFailures = 0;
         if (state.status === ENGINE_STATES.RUNNING) {
           decideNow();
-          await sleep(75);
+          await sleep(20);
         }
       } catch (error) {
         if (error?.name === 'AbortError') break;
         state.lastError = String(error?.message || error);
         state.session.stats.errors += 1;
-        pushLog('error', `Combat controller error: ${state.lastError}`);
-        try { await sleep(800); } catch (_) { break; }
+        const networkFailure = /timed?\s*out|network|failed\s+to\s+fetch|load\s+failed/i.test(state.lastError);
+        if (networkFailure) {
+          state.consecutiveNetworkFailures = Math.min(4, Number(state.consecutiveNetworkFailures || 0) + 1);
+          const now = Date.now();
+          if (now - Number(state.lastNetworkWarningAt || 0) >= 10_000) {
+            state.lastNetworkWarningAt = now;
+            pushLog('warning', `Network is slow or unavailable; combat will retry in the background (${state.lastError}).`);
+          }
+          try { await sleep(Math.min(4_000, 500 * (2 ** (state.consecutiveNetworkFailures - 1)))); } catch (_) { break; }
+        } else {
+          pushLog('error', `Combat controller error: ${state.lastError}`);
+          try { await sleep(500); } catch (_) { break; }
+        }
       }
     }
   }
@@ -6407,6 +6581,12 @@ async function aurelixGetUpdateStatus(force = false) {
     state.potionUsage = {};
     state.failedLoadoutGroups.clear();
     state.failedLoadoutAt.clear();
+    state.deadBuffRelayUntil.clear();
+    state.deadCombatTargetsUntil.clear();
+    state.loadoutDetectionPromise = null;
+    state.consecutiveNetworkFailures = 0;
+    state.lastNetworkWarningAt = 0;
+    state.loadoutSnapshotCache = { equipment:null, pets:null, checkedAt:0 };
     state.activeLoadout = { equipmentPresetId:null, petPresetId:null, detected:false, checkedAt:0 };
     state.attackInFlight = false;
     state.staminaPotionAwaitingAction = false;
@@ -6433,15 +6613,17 @@ async function aurelixGetUpdateStatus(force = false) {
     state.status = ENGINE_STATES.RUNNING;
     state.liveResources = clone(window.AURELIX?.getReport?.()?.resources?.player || {});
     syncLegacyPresets();
-    try { await detectActiveLoadout(); }
-    catch (error) {
-      if (error?.name === 'AbortError') return getRuntimeState();
-      pushLog('warning', `Initial loadout detection unavailable: ${error?.message || error}. Presets will still be verified before combat.`);
-    }
     const report = window.AURELIX?.getReport?.();
-    if (!report) await reconcileScanner();
-    else decideNow();
-    void refreshActiveSkills(Object.keys(state.skillCatalog).length === 0);
+    if (!report) {
+      pushLog('system', 'Engine started; waiting for the initial scanner snapshot in the background.');
+      void reconcileScanner().catch(error => {
+        if (error?.name !== 'AbortError') pushLog('warning', `Initial scanner snapshot unavailable: ${error?.message || error}`);
+      });
+    } else {
+      decideNow();
+    }
+    // Loadouts and skills are discovered from the target's required combat pages.
+    // Avoid competing startup requests on slow mobile or unstable networks.
     state.dungeonLootSweepPending = state.settings.autoLoot !== false;
     ensureCombatLoop();
     emit();
@@ -6632,7 +6814,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const VERSION = '0.5.67';
+  const VERSION = '0.5.72';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
