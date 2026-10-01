@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.5.72
+// @version      0.5.74
 // @description  AURELIX automation engine with smart combat, presets, resource recovery, auto loot, and adaptive targeting.
 // @icon         https://raw.githubusercontent.com/cosmic451/afb-assets/main/aurelixauto.png
 // @match        https://demonicscans.org/*
@@ -20,7 +20,7 @@
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.5.72',
+  currentVersion: '0.5.74',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -60,7 +60,6 @@ function aurelixCompareVersions(a, b) {
 
   return 0;
 }
-
 
 function aurelixCheckForUpdate() {
   return new Promise((resolve, reject) => {
@@ -1997,7 +1996,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.5.72';
+  const ENGINE_VERSION = '0.5.74';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -2010,7 +2009,7 @@ async function aurelixGetUpdateStatus(force = false) {
     equipmentPresets: 'aurelix_equipment_presets_v0544',
     petPresets: 'aurelix_pet_presets_v0544',
     loadoutAssignments: 'aurelix_target_loadout_assignments_v0544',
-    legacyPresetImport: 'aurelix_legacy_preset_import_v0544'
+    legacyPresetImport: 'aurelix_legacy_preset_import_v0573'
   });
   const PHASE_RUNTIME_STORE = 'aurelix_engine_phase_runtime_v0542';
   const ENGINE_STATES = Object.freeze({
@@ -2466,6 +2465,7 @@ async function aurelixGetUpdateStatus(force = false) {
       startedAt: null,
       stoppedAt: null,
       elapsedBeforeStopMs: 0,
+      completedTargets: {},
       stats: {
         completed: 0,
         attacks: 0,
@@ -2547,6 +2547,7 @@ async function aurelixGetUpdateStatus(force = false) {
       stoppedAt: state.session.stoppedAt,
       elapsedMs: runtimeElapsedMs(),
       summary: state.session.stats,
+      completedTargets: clone(state.session.completedTargets || {}),
       resources: { ...(window.AURELIX?.getReport?.()?.resources?.player || {}), ...state.liveResources },
       currentTarget: state.currentTarget,
       currentPlan: state.currentPlan,
@@ -2581,6 +2582,11 @@ async function aurelixGetUpdateStatus(force = false) {
     if (entry.type === 'error') console.error(`[AURELIX:ERROR] ${entry.message}`);
     emit({ latestLog: entry });
     return entry;
+  }
+  function recordCompletedTarget(target) {
+    const name = String(target?.name || 'Unknown Target').trim() || 'Unknown Target';
+    state.session.completedTargets ||= {};
+    state.session.completedTargets[name] = (Number(state.session.completedTargets[name]) || 0) + 1;
   }
   function normalizeSettings(next) {
     const mode = ['full', 'gate', 'dungeon'].includes(next?.mode) ? next.mode : DEFAULT_SETTINGS.mode;
@@ -3189,7 +3195,7 @@ async function aurelixGetUpdateStatus(force = false) {
       liveActionsEnabled: true
     };
     if (selected?.entityId && selected.entityId !== previousEntityId) {
-      pushLog('target', `Selected ${selected.name}.`, {
+      pushLog('target', `Target selected: ${selected.name}.`, {
         source: selected.source,
         logicalKey: selected.logicalKey,
         runtimeId: selected.runtimeId,
@@ -3211,7 +3217,7 @@ async function aurelixGetUpdateStatus(force = false) {
       return null;
     }
     try {
-      pushLog('scan', 'Refreshing world state.');
+      pushLog('scan', 'Refreshing target and resource data.');
       const report = await scanner.scanNow();
       if (state.abortController?.signal?.aborted) return null;
       decideNow();
@@ -3220,7 +3226,7 @@ async function aurelixGetUpdateStatus(force = false) {
       if (state.abortController?.signal?.aborted) return null;
       state.lastError = String(error?.message || error);
       state.session.stats.errors += 1;
-      pushLog('error', `Scanner refresh failed: ${state.lastError}`);
+      pushLog('error', `Could not refresh target data: ${state.lastError}`);
       return null;
     }
   }
@@ -3465,11 +3471,12 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   async function loadoutRequest(url, { method='GET', params=null, expect='auto' } = {}) {
     let target = url;
+    const verb = String(method).toUpperCase();
     const options = {
-      method,
+      method:verb,
       signal:loadoutSignal(),
-      timeoutMs:String(method).toUpperCase() === 'GET' ? 7_000 : 8_000,
-      safeRetries:String(method).toUpperCase() === 'GET' ? 1 : 0
+      timeoutMs:15_000,
+      safeRetries:verb === 'GET' ? 1 : 0
     };
     if (String(method).toUpperCase() === 'GET' && params) {
       const query = new URLSearchParams();
@@ -3481,7 +3488,15 @@ async function aurelixGetUpdateStatus(force = false) {
       options.headers = { 'Content-Type':'application/x-www-form-urlencoded' };
       options.body = body.toString();
     }
-    const { res, text } = await fetchText(target, options);
+    let response;
+    try {
+      response = await fetchText(target, options);
+    } catch (error) {
+      if (verb !== 'GET' || options.signal?.aborted || !/timed?\s*out|network|failed\s+to\s+fetch|load\s+failed/i.test(String(error?.message || error))) throw error;
+      await sleep(500, options.signal);
+      response = await fetchText(target, { ...options, safeRetries:1 });
+    }
+    const { res, text } = response;
     if (!res.ok) throw new Error(`${url} HTTP ${res.status}: ${text.slice(0,160)}`);
     if (expect === 'text') return text;
     if (expect === 'json') {
@@ -3497,34 +3512,76 @@ async function aurelixGetUpdateStatus(force = false) {
       const slot = match ? LOADOUT_SLOT_BY_ID[String(match[1])] : null;
       const image = box.querySelector('.item-container img, img');
       if (!slot || !image) return;
+      const carrier = box.querySelector('[data-inv-id], [data-inventory-id], [data-invid]');
+      const directInvId = carrier?.dataset?.invId || carrier?.dataset?.inventoryId || carrier?.dataset?.invid || box.dataset?.invId || null;
       result[slot] = {
         slot, slotId:Number(match[1]),
         name:box.querySelector('.info-btn')?.dataset?.name || image.alt || slot,
         image:normalizeAssetPath(image.getAttribute('src')),
+        invId:directInvId && /^\d+$/.test(String(directInvId)) ? String(directInvId) : null,
         crystals:[]
       };
     });
     return result;
   }
   function parseUnequippedEquipment(doc) {
-    const byImage = new Map(), byName = new Map();
+    const records = [], seen = new Set();
+    [...doc.querySelectorAll('.slot-box[data-inv-id], [data-inv-id][data-item-type], [data-inv-id][data-typee]')].forEach(card => {
+      const invId = card.getAttribute('data-inv-id')?.trim();
+      if (!invId || !/^\d+$/.test(invId)) return;
+      const image = card.querySelector('img'), info = card.querySelector('.info-btn');
+      records.push({
+        itemId:card.getAttribute('data-equip') || null,
+        type:String(card.getAttribute('data-item-type') || card.getAttribute('data-typee') || '').trim().toLowerCase(),
+        invId:String(invId),
+        name:info?.dataset?.name || card.querySelector('.equipment-item-name')?.textContent?.trim() || image?.alt || '',
+        image:normalizeAssetPath(image?.getAttribute('src')),
+        source:'data-inv-id'
+      });
+      seen.add(String(invId));
+    });
     [...doc.querySelectorAll('button[onclick*="showEquipModal"]')].forEach(button => {
       const match = (button.getAttribute('onclick') || '').match(/showEquipModal\(\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*,\s*['"]?(\d+)['"]?\s*\)/i);
-      if (!match) return;
-      const card = button.closest('.equipment-item, .item-card, .equipment-card, .inventory-item, .legendary, .epic, .rare') || button.parentElement?.parentElement;
+      if (!match || seen.has(String(match[3]))) return;
+      const card = button.closest('.slot-box, .equipment-item, .item-card, .equipment-card, .inventory-item') || button.parentElement?.parentElement;
       const image = card?.querySelector('img');
-      const rec = { itemId:match[1], type:match[2], invId:match[3], name:card?.querySelector('.equipment-item-name')?.textContent?.trim() || image?.alt || '', image:normalizeAssetPath(image?.getAttribute('src')) };
-      if (rec.image) byImage.set(rec.image, rec);
-      if (rec.name) byName.set(rec.name.toLowerCase(), rec);
+      records.push({
+        itemId:match[1], type:String(match[2]).trim().toLowerCase(), invId:String(match[3]),
+        name:card?.querySelector('.info-btn')?.dataset?.name || card?.querySelector('.equipment-item-name')?.textContent?.trim() || image?.alt || '',
+        image:normalizeAssetPath(image?.getAttribute('src')), source:'showEquipModal'
+      });
+      seen.add(String(match[3]));
     });
-    return { byImage, byName };
+    return records;
+  }
+  function expectedEquipmentType(item) {
+    if (item?.slot === 'ring1' || item?.slot === 'ring2') return 'ring';
+    if (item?.slot === 'classWeapon') return 'class weapon';
+    return String(item?.slot || '').toLowerCase();
+  }
+  function resolveEquipmentInventoryId(item, records) {
+    if (item?.invId && /^\d+$/.test(String(item.invId))) return String(item.invId);
+    const image = normalizeAssetPath(item?.image), name = String(item?.name || '').trim().toLowerCase();
+    const wantedType = expectedEquipmentType(item);
+    const typeOK = record => !wantedType || !record.type || record.type === wantedType || (wantedType === 'class weapon' && /class.?weapon/i.test(record.type));
+    const uniqueId = matches => {
+      const ids = [...new Set(matches.map(record => String(record.invId || '')).filter(id => /^\d+$/.test(id)))];
+      return ids.length === 1 ? ids[0] : null;
+    };
+    return uniqueId(records.filter(record => image && record.image === image && typeOK(record)))
+      || uniqueId(records.filter(record => name && String(record.name || '').trim().toLowerCase() === name && typeOK(record)))
+      || uniqueId(records.filter(record => image && record.image === image))
+      || uniqueId(records.filter(record => name && String(record.name || '').trim().toLowerCase() === name))
+      || null;
   }
   function parseCrystalEquipment(doc) {
     return [...doc.querySelectorAll('.equipment-card')].map(card => {
       const image = normalizeAssetPath(card.querySelector('img')?.getAttribute('src'));
       const crystals = [...card.querySelectorAll('[onclick*="openConfirmUnequip"]')].map(button => ({
         id:(button.getAttribute('onclick') || '').match(/openConfirmUnequip\((\d+)\)/)?.[1] || null,
-        image:normalizeAssetPath(button.querySelector('img')?.getAttribute('src'))
+        image:normalizeAssetPath(button.querySelector('img')?.getAttribute('src')),
+        type:/draconic|dad\.webp/i.test(button.querySelector('img')?.getAttribute('src') || '') ? 'draconic'
+          : (/mountain/i.test(button.querySelector('img')?.getAttribute('src') || '') ? 'mountain' : 'unknown')
       })).filter(x => x.id);
       const equipmentInvId = (card.querySelector('[onclick*="openPickerModal"]')?.getAttribute('onclick') || '').match(/openPickerModal\((\d+)\)/)?.[1] || null;
       return { image, equipmentInvId, crystals };
@@ -3545,7 +3602,7 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     for (const item of Object.values(equipped)) {
       const crystalCandidates = crystalByImage.get(normalizeAssetPath(item.image)) || [];
-      const card = crystalCandidates.length === 1 ? crystalCandidates[0] : null;
+      const card = (item.invId && crystalByInvId.get(String(item.invId))) || (crystalCandidates.length === 1 ? crystalCandidates[0] : null);
       if (card?.equipmentInvId) item.invId = String(card.equipmentInvId);
       item.crystals = card?.crystals || [];
     }
@@ -3583,18 +3640,16 @@ async function aurelixGetUpdateStatus(force = false) {
     };
     const equipped = parseEquippedEquipment(inventoryDocs.attack);
     if (!Object.keys(equipped).length) throw new Error('No PvE equipment detected.');
-    const byImage = new Map(), byName = new Map();
+    const inventoryRecords = [];
     for (const doc of Object.values(inventoryDocs)) {
-      const parsed = parseUnequippedEquipment(doc);
-      for (const [key,value] of parsed.byImage) if (!byImage.has(key)) byImage.set(key,value);
-      for (const [key,value] of parsed.byName) if (!byName.has(key)) byName.set(key,value);
+      inventoryRecords.push(...parseUnequippedEquipment(doc));
     }
     const crystalCards = parseCrystalEquipment(docFromHtml(crystalHtml));
     const crystalByImage = new Map(crystalCards.filter(x => x.image).map(x => [x.image,x]));
     const crystalByInvId = new Map(crystalCards.filter(x => x.equipmentInvId).map(x => [String(x.equipmentInvId),x]));
     for (const item of Object.values(equipped)) {
-      const inventory = byImage.get(item.image) || byName.get(String(item.name).toLowerCase());
-      if (inventory) item.invId = inventory.invId;
+      const resolved = resolveEquipmentInventoryId(item, inventoryRecords);
+      if (resolved) item.invId = resolved;
       const card = (item.invId && crystalByInvId.get(String(item.invId))) || crystalByImage.get(item.image);
       item.crystals = card?.crystals || [];
       if (!item.invId && card?.equipmentInvId) item.invId = card.equipmentInvId;
@@ -3611,6 +3666,61 @@ async function aurelixGetUpdateStatus(force = false) {
     return clone(preset);
   }
   async function equipmentPost(data) { return loadoutRequest('/inventory_ajax.php', { method:'POST', params:data, expect:'text' }); }
+  function readCrystalIntent(doc) {
+    return doc?.querySelector('#equipCrystalForm input[name="crystal_intent"], #unequipCrystalForm input[name="crystal_intent"], input[name="crystal_intent"]')?.value?.trim() || '';
+  }
+  function crystalLocationsFromDocument(doc) {
+    const locations = new Map();
+    for (const card of parseCrystalEquipment(doc)) {
+      for (const crystal of card.crystals || []) locations.set(String(crystal.id), {
+        invId:card.equipmentInvId ? String(card.equipmentInvId) : null,
+        image:normalizeAssetPath(card.image)
+      });
+    }
+    return locations;
+  }
+  function crystalLocationMatchesItem(location, item) {
+    return !!location && (
+      (location.invId && String(location.invId) === String(item?.invId || ''))
+      || (!location.invId && location.image === normalizeAssetPath(item?.image))
+    );
+  }
+  async function mutateCrystalSafely(data, verify, label) {
+    let lastError = '';
+    for (let attempt=0; attempt<2; attempt++) {
+      let pageText = '';
+      try {
+        pageText = await loadoutRequest('/power_crystals.php', { expect:'text' });
+        const page = docFromHtml(pageText), token = readCrystalIntent(page);
+        if (!token) throw new Error('Power Crystals page did not provide a fresh crystal_intent.');
+        if (verify(page)) return page;
+        const body = new URLSearchParams({ crystal_intent:token });
+        Object.entries(data).forEach(([key,value]) => body.set(key, String(value)));
+        const { res, text } = await fetchText('/power_crystals.php', {
+          method:'POST',
+          headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+          body:body.toString(),
+          signal:loadoutSignal(), timeoutMs:8_000, safeRetries:0
+        });
+        if (res.ok) {
+          const resultDoc = docFromHtml(text);
+          if (verify(resultDoc)) return resultDoc;
+          lastError = `${label}: resulting crystal page did not confirm the change`;
+        } else lastError = `${label}: HTTP ${res.status}`;
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        lastError = error?.message || String(error);
+      }
+      try {
+        const authoritative = docFromHtml(await loadoutRequest('/power_crystals.php', { expect:'text' }));
+        if (verify(authoritative)) return authoritative;
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        lastError += ` | verification: ${error?.message || error}`;
+      }
+    }
+    throw new Error(`${label} failed after safe verification: ${lastError}`);
+  }
   async function applyEquipmentPreset(preset, initialCurrent = null, { verify = true } = {}) {
     if (!normalizeEquipmentPreset(preset)) throw new Error('Invalid PvE equipment preset.');
     const current = initialCurrent || await fetchEquipmentSnapshot();
@@ -3624,8 +3734,14 @@ async function aurelixGetUpdateStatus(force = false) {
       const location = currentCrystalLocation.get(String(crystal.id));
       const correct = location && ((location.invId && location.invId === String(item.invId)) || (!location.invId && location.image === normalizeAssetPath(item.image)));
       if (!location || correct) continue;
-      await loadoutRequest('/power_crystals.php', { method:'POST', params:{ action:'unequip_crystal', crystal_id:crystal.id }, expect:'text' });
-      currentCrystalLocation.delete(String(crystal.id)); changed++; await loadoutSleep(40);
+      const resultDoc = await mutateCrystalSafely(
+        { action:'unequip_crystal', crystal_id:crystal.id },
+        doc => !crystalLocationsFromDocument(doc).has(String(crystal.id)),
+        `Unlink crystal ${crystal.id}`
+      );
+      currentCrystalLocation.clear();
+      for (const [id,loc] of crystalLocationsFromDocument(resultDoc)) currentCrystalLocation.set(id,loc);
+      changed++; await loadoutSleep(40);
     }
     for (const slot of Object.keys(LOADOUT_SLOTS)) {
       const wanted = desired[slot];
@@ -3643,17 +3759,48 @@ async function aurelixGetUpdateStatus(force = false) {
       const location = currentCrystalLocation.get(String(crystal.id));
       const correct = location && ((location.invId && location.invId === String(item.invId)) || (!location.invId && location.image === normalizeAssetPath(item.image)));
       if (correct) continue;
-      await loadoutRequest('/power_crystals.php', { method:'POST', params:{ action:'equip_crystal', crystal_id:crystal.id, equipment_inv_id:item.invId }, expect:'text' });
+      const resultDoc = await mutateCrystalSafely(
+        { action:'equip_crystal', crystal_id:crystal.id, equipment_inv_id:item.invId },
+        doc => crystalLocationMatchesItem(crystalLocationsFromDocument(doc).get(String(crystal.id)), item),
+        `Link crystal ${crystal.id}`
+      );
+      currentCrystalLocation.clear();
+      for (const [id,loc] of crystalLocationsFromDocument(resultDoc)) currentCrystalLocation.set(id,loc);
       changed++; await loadoutSleep(40);
     }
     if (verify && !equipmentPresetMatches(preset, await fetchEquipmentSnapshot())) throw new Error('Equipment and crystal verification failed.');
     return changed;
   }
-  function petRecordFromCard(id, name, image) {
+  function emptyPetAttachments() {
+    return { attack:null, defense:null, elemental:null };
+  }
+  function normalizePetAttachment(item) {
+    if (!item || item.item_id == null) return null;
+    return {
+      item_id:String(item.item_id),
+      name:String(item.name || ''),
+      image:normalizeAssetPath(item.image_url || item.image || ''),
+      element:String(item.element || item.ELEMENT || '').trim().toUpperCase(),
+      attack:Number(item.attack || item.ATTACK || 0),
+      defense:Number(item.defense || item.DEFENSE || 0)
+    };
+  }
+  function normalizePetAttachments(input) {
+    const out = emptyPetAttachments();
+    for (const type of ['attack','defense','elemental']) out[type] = normalizePetAttachment(input?.[type]);
+    return out;
+  }
+  function petRecordFromCard(id, name, image, attachmentsCaptured = false, attachments = null) {
     let absoluteImage = '';
     try { absoluteImage = image ? new URL(image, location.href).href : ''; }
     catch (_) { absoluteImage = String(image || ''); }
-    return { id:id == null ? null : String(id), name:name || `Pet ${id}`, image:absoluteImage };
+    return {
+      id:id == null ? null : String(id),
+      name:name || `Pet ${id}`,
+      image:absoluteImage,
+      attachmentsCaptured:attachmentsCaptured === true,
+      attachments:attachmentsCaptured === true ? normalizePetAttachments(attachments) : emptyPetAttachments()
+    };
   }
   let petCatalogueCache = null;
   let petCatalogueCachedAt = 0;
@@ -3684,7 +3831,9 @@ async function aurelixGetUpdateStatus(force = false) {
       return petRecordFromCard(candidate.inv_id, candidate.name || pet?.name, candidate.img || pet?.image);
     }).sort((a,b) => a.name.localeCompare(b.name));
   }
-  function emptyPetFormationSlot() { return { main:null, links:{ 1:null, 2:null } }; }
+  function emptyPetFormationSlot() {
+    return { main:null, links:{ 1:null, 2:null }, attachmentsCaptured:false, attachments:emptyPetAttachments() };
+  }
   function normalizePetFormation(input) {
     const now = Date.now();
     const out = {
@@ -3695,10 +3844,20 @@ async function aurelixGetUpdateStatus(force = false) {
     };
     for (let slot=1; slot<=3; slot++) {
       const source = input?.slots?.[slot] || input?.slots?.[String(slot)] || {};
-      if (source.main?.id) out.slots[slot].main = petRecordFromCard(source.main.id, source.main.name, source.main.image);
+      if (source.main?.id) {
+        const captured = source.main.attachmentsCaptured === true || source.attachmentsCaptured === true;
+        const attachments = source.main.attachmentsCaptured === true ? source.main.attachments : source.attachments;
+        out.slots[slot].main = petRecordFromCard(source.main.id, source.main.name, source.main.image, captured, attachments);
+        out.slots[slot].attachmentsCaptured = captured;
+        out.slots[slot].attachments = captured ? normalizePetAttachments(attachments) : emptyPetAttachments();
+      }
       for (let level=1; level<=2; level++) {
         const linked = source.links?.[level] || source.links?.[String(level)];
-        if (linked?.id) out.slots[slot].links[level] = petRecordFromCard(linked.id, linked.name, linked.image);
+        if (linked?.id) out.slots[slot].links[level] = petRecordFromCard(
+          linked.id, linked.name, linked.image,
+          linked.attachmentsCaptured === true,
+          linked.attachments
+        );
       }
     }
     return out;
@@ -3752,6 +3911,81 @@ async function aurelixGetUpdateStatus(force = false) {
     if (data?.status !== 'success') throw new Error(data?.message || `Could not read links for pet ${id}.`);
     return data;
   }
+  async function fetchPetAttachmentState(petId, slotType) {
+    if (!petId) throw new Error('Missing pet inventory ID while reading attachments.');
+    if (!['attack','defense','elemental'].includes(slotType)) throw new Error(`Invalid pet attachment slot: ${slotType}`);
+    const data = await loadoutRequest('/pet_sigils_ajax.php', {
+      params:{ pet_inv_id:petId, slot_type:slotType }, expect:'json'
+    });
+    if (data?.status !== 'success') throw new Error(data?.message || `Could not read ${slotType} attachment for pet ${petId}.`);
+    return data;
+  }
+  async function capturePetAttachments(petId) {
+    const types = ['attack','defense','elemental'];
+    const states = await Promise.all(types.map(type => fetchPetAttachmentState(petId, type)));
+    const out = emptyPetAttachments();
+    types.forEach((type,index) => { out[type] = normalizePetAttachment(states[index]?.current); });
+    return out;
+  }
+  async function setPetAttachment(petId, slotType, desired) {
+    const desiredId = desired?.item_id ? String(desired.item_id) : '';
+    let lastError = '';
+    for (let pass=0; pass<2; pass++) {
+      const stateNow = await fetchPetAttachmentState(petId, slotType);
+      const currentId = stateNow.current?.item_id ? String(stateNow.current.item_id) : '';
+      if (currentId === desiredId) return false;
+      if (!stateNow.csrf_token) throw new Error(`Game did not provide a ${slotType} attachment security token.`);
+      if (desiredId) {
+        const option = (stateNow.options || []).find(item => String(item.item_id) === desiredId);
+        if (!option) throw new Error(`${desired?.name || desiredId} is not available for ${slotType}.`);
+        if (Number(option.available || 0) <= 0 && currentId !== desiredId) throw new Error(`${desired?.name || desiredId}: no free copies are available.`);
+      }
+      try {
+        const result = await loadoutRequest('/pet_sigil_action.php', {
+          method:'POST', expect:'json', params:{
+            action:desiredId ? 'equip' : 'remove', pet_inv_id:petId,
+            slot_type:slotType, csrf_token:stateNow.csrf_token,
+            ...(desiredId ? { item_id:desiredId } : {})
+          }
+        });
+        if (result?.status === 'success') return true;
+        lastError = result?.message || `${slotType} attachment update failed.`;
+        if (result?.code === 'csrf_expired' && pass === 0) continue;
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        lastError = error?.message || String(error);
+      }
+      const verified = await fetchPetAttachmentState(petId, slotType).catch(() => null);
+      const verifiedId = verified?.current?.item_id ? String(verified.current.item_id) : '';
+      if (verifiedId === desiredId) return true;
+    }
+    throw new Error(`${slotType} attachment update failed after verification: ${lastError}`);
+  }
+  function presetHasCapturedPetAttachments(preset) {
+    for (let slot=1; slot<=3; slot++) {
+      const cfg = preset?.slots?.[slot] || preset?.slots?.[String(slot)];
+      if (cfg?.main?.attachmentsCaptured === true) return true;
+      for (let level=1; level<=2; level++) if (cfg?.links?.[level]?.attachmentsCaptured === true) return true;
+    }
+    return false;
+  }
+  async function applyCapturedPetAttachments(preset) {
+    let changed = 0;
+    for (let slot=1; slot<=3; slot++) {
+      const cfg = preset?.slots?.[slot] || preset?.slots?.[String(slot)];
+      const pets = [cfg?.main, cfg?.links?.[1], cfg?.links?.[2]];
+      for (const pet of pets) {
+        if (!pet?.id || pet.attachmentsCaptured !== true) continue;
+        for (const type of ['attack','defense','elemental']) {
+          if (await setPetAttachment(pet.id, type, pet.attachments?.[type] || null)) {
+            changed++;
+            await loadoutSleep(20);
+          }
+        }
+      }
+    }
+    return changed;
+  }
   async function fetchPetSnapshot() {
     const html = await loadoutRequest('/pets.php', { params:{ team:'attack' }, expect:'text' });
     const doc = docFromHtml(html), result = {}, equipped = [];
@@ -3791,11 +4025,20 @@ async function aurelixGetUpdateStatus(force = false) {
     const slots = {};
     for (let slot=1; slot<=3; slot++) {
       const main = current[slot];
-      slots[slot] = { main:{ id:main.id, name:main.name, image:main.image }, links:{ 1:null, 2:null } };
+      const mainAttachments = await capturePetAttachments(main.id);
+      slots[slot] = {
+        main:petRecordFromCard(main.id, main.name, main.image, true, mainAttachments),
+        links:{ 1:null, 2:null },
+        attachmentsCaptured:true,
+        attachments:normalizePetAttachments(mainAttachments)
+      };
       const data = main._linkState || { links:[] };
       for (const link of data.links || []) {
         const level = Number(link.link_level), id = link.inv_id ?? link.link_pet_id;
-        if ((level === 1 || level === 2) && id) slots[slot].links[level] = petRecordFromCard(id, link.name, link.img);
+        if ((level === 1 || level === 2) && id) {
+          const linkedAttachments = await capturePetAttachments(id);
+          slots[slot].links[level] = petRecordFromCard(id, link.name, link.img, true, linkedAttachments);
+        }
       }
     }
     const preset = { id:`axpet_${now.toString(36)}${Math.random().toString(36).slice(2,7)}`, name:normalizeSpace(name) || `Pet Preset ${state.petPresets.length + 1}`, team:'attack', slots, createdAt:now, updatedAt:now };
@@ -3848,7 +4091,8 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!normalizePetPreset(preset)) throw new Error('Invalid PvE pet preset.');
     validatePetFormation(preset);
     const current = initialCurrent || await fetchPetSnapshot();
-    if (petPresetMatches(preset, current)) return 0;
+    const formationAlreadyMatched = petPresetMatches(preset, current);
+    if (formationAlreadyMatched && !presetHasCapturedPetAttachments(preset)) return 0;
     const desiredMainIds = new Set(), desiredLinkUsage = new Map();
     for (let slot=1; slot<=3; slot++) {
       const cfg = preset.slots[slot] || preset.slots[String(slot)];
@@ -3899,6 +4143,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const data = desiredStateById.get(String(cfg.main.id));
       for (let level=1; level<=2; level++) if (cfg.links?.[level]?.id && await petLinkKnown(cfg.main.id, level, cfg.links[level].id, data)) { changed++; await loadoutSleep(25); }
     }
+    changed += await applyCapturedPetAttachments(preset);
     if (verify && !petPresetMatches(preset, await fetchPetSnapshot())) throw new Error('Pet preset verification failed.');
     return changed;
   }
@@ -3933,7 +4178,7 @@ async function aurelixGetUpdateStatus(force = false) {
           pets ? (cachedSnapshot?.pets || fetchPetSnapshot()) : Promise.resolve(null)
         ]);
         const equipmentMatched = !equipment || equipmentPresetMatches(equipment, equipmentSnapshot);
-        const petsMatched = !pets || petPresetMatches(pets, petSnapshot);
+        const petsMatched = !pets || (petPresetMatches(pets, petSnapshot) && !presetHasCapturedPetAttachments(pets));
         if (equipment && !equipmentMatched) {
           pushLog('system', `Applying equipment preset “${equipment.name}”…`);
           changed += await applyEquipmentPreset(equipment, equipmentSnapshot, { verify:false });
@@ -3997,7 +4242,7 @@ async function aurelixGetUpdateStatus(force = false) {
       state.session.stats.errors += 1;
       pushLog(
         isNetworkFailure ? 'warning' : 'error',
-        `Loadout group skipped for ${target?.name || 'target'}: ${error?.message || error}${isNetworkFailure ? ' (network retry in 5s)' : ''}`
+        isNetworkFailure ? `Could not prepare ${target?.name || 'target'}'s assigned loadout because the server did not respond in time. Retrying shortly.` : `Could not prepare ${target?.name || 'target'}'s assigned loadout: ${error?.message || error}`
       );
       decideNow();
       return false;
@@ -4011,7 +4256,7 @@ async function aurelixGetUpdateStatus(force = false) {
       state.loadoutSnapshotCache = { equipment, pets, checkedAt:Date.now() };
       state.activeLoadout = {
         equipmentPresetId:state.equipmentPresets.find(p => equipmentPresetMatches(p, equipment))?.id || null,
-        petPresetId:state.petPresets.find(p => petPresetMatches(p, pets))?.id || null,
+        petPresetId:state.petPresets.find(p => !presetHasCapturedPetAttachments(p) && petPresetMatches(p, pets))?.id || null,
         detected:true, checkedAt:Date.now()
       };
       emit();
@@ -4381,7 +4626,15 @@ async function aurelixGetUpdateStatus(force = false) {
     let data = null;
     try { data = JSON.parse(text); } catch (_) {}
     const message = normalizeSpace(data?.message || data?.error || text);
+    updateLiveCombatResources(data);
     if (!res.ok || !data || (data.status && data.status !== 'success')) {
+      if (/\byou\s+are\s+dead\b|\byou\s+died\b|\bplayer\s+is\s+dead\b/i.test(message)) {
+        state.liveResources.hp = 0;
+        const recovered = await useEmergencyPotion('hp');
+        if (recovered) return { ok:true, cooldownOnly:true, recoveredHp:true, damage:damageBefore };
+        pushLog('warning', `${skill.name} relay stopped because the player is dead and no selected HP potion could be used.`);
+        return { ok:false, reason:'player-dead', damage:damageBefore };
+      }
       if (/already\s*dead|monster\s*is\s*already\s*dead/i.test(message)) {
         state.deadBuffRelayUntil.set(runtimeEncounterKey(carrier), Date.now() + 120_000);
         pushLog('skill', `${carrier.name} is dead; switching ${skill.name} immediately to another live relay mob.`);
@@ -4395,7 +4648,7 @@ async function aurelixGetUpdateStatus(force = false) {
     const afterMana = parseNumber(data.mana);
     if (Number.isFinite(afterStamina)) state.liveResources.stamina = afterStamina;
     if (Number.isFinite(afterMana)) state.liveResources.mana = afterMana;
-    if (data.retaliation?.user_hp_after != null) state.liveResources.hp = Number(data.retaliation.user_hp_after);
+    updateLiveCombatResources(data);
     updateLiveExpFromAttack(data);
     const spentStamina = Number.isFinite(beforeStamina) && Number.isFinite(afterStamina)
       ? Math.max(0, beforeStamina - afterStamina)
@@ -4658,6 +4911,8 @@ async function aurelixGetUpdateStatus(force = false) {
     };
     if (identityOk) {
       syncCurrentTargetVisual(target, snapshot);
+      if (snapshot.playerHp && Number.isFinite(Number(snapshot.playerHp.current))) state.liveResources.hp = Math.max(0, Number(snapshot.playerHp.current));
+      if (snapshot.playerHp && Number.isFinite(Number(snapshot.playerHp.max)) && Number(snapshot.playerHp.max) > 0) state.liveResources.hpMax = Number(snapshot.playerHp.max);
       if (snapshot.playerMana && Number.isFinite(Number(snapshot.playerMana.current))) state.liveResources.mana = Number(snapshot.playerMana.current);
       if (snapshot.playerMana && Number.isFinite(Number(snapshot.playerMana.max))) state.liveResources.manaMax = Number(snapshot.playerMana.max);
     }
@@ -4859,6 +5114,22 @@ async function aurelixGetUpdateStatus(force = false) {
     const fromReport = nullableNumber(report?.resources?.player?.mana);
     return fromReport != null && fromReport >= 0 ? fromReport : null;
   }
+  function updateLiveCombatResources(data) {
+    if (!data || typeof data !== 'object') return false;
+    let changed = false;
+    const stamina = parseNumber(data.stamina ?? data.current_stamina);
+    const mana = parseNumber(data.mana ?? data.current_mana);
+    const hp = parseNumber(
+      data.retaliation?.user_hp_after
+      ?? data.user_hp_after
+      ?? data.current_hp
+      ?? data.hp
+    );
+    if (Number.isFinite(stamina)) { state.liveResources.stamina = stamina; changed = true; }
+    if (Number.isFinite(mana)) { state.liveResources.mana = mana; changed = true; }
+    if (Number.isFinite(hp)) { state.liveResources.hp = Math.max(0, hp); changed = true; }
+    return changed;
+  }
   function potionInventory() {
     const report = window.AURELIX?.getReport?.();
     const raw = report?.potions || report?.resources?.potions || [];
@@ -4866,7 +5137,7 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   function selectedPotion(kind) {
     migratePotionPoliciesFromReport();
-    const options = potionInventory().filter(p => p && p.type === kind);
+    const options = potionInventory().filter(p => p && potionKind(p) === kind);
     for (const potion of options) {
       const resolved = policyForPotion(potion);
       const policy = resolved.policy || {};
@@ -5088,8 +5359,9 @@ async function aurelixGetUpdateStatus(force = false) {
           if (error?.name === 'AbortError') throw error;
         }
         if (!(Number(state.liveResources.hp) > 0)) {
-          const hpMax = Number(state.liveResources.hpMax || window.AURELIX?.getReport?.()?.resources?.player?.hpMax);
-          state.liveResources.hp = Number.isFinite(hpMax) && hpMax > 0 ? hpMax : 1;
+          pushLog('warning', 'The HP potion request was accepted, but recovered HP could not be confirmed. Combat will remain stopped for safety.');
+          emit();
+          return false;
         }
       }
       const limitText = limit > 0 ? `${state.potionUsage[usageKey]}/${limit}` : `${state.potionUsage[usageKey]}`;
@@ -5856,7 +6128,11 @@ async function aurelixGetUpdateStatus(force = false) {
       if ((damage == null || damage === 0) && /support\s+skill|no\s+direct\s+damage|buff|transfer|activated|applied/.test(extra)) return true;
       if (damage === 0) return true;
     }
-    return !!skillName && cleanMessage.includes(skillName) && /support\s+skill|no\s+direct\s+damage|buff|activated|applied|you\s+used/.test(cleanMessage);
+    if (!!skillName && cleanMessage.includes(skillName) && /support\s+skill|no\s+direct\s+damage|buff|activated|applied|you\s+used/.test(cleanMessage)) return true;
+    // The skill endpoint is authoritative: an explicit success response for a
+    // known support skill means the activation was accepted even when older
+    // server responses omit logs/extra_info.
+    return data.status === 'success' && !/rejected|failed|cannot|can't|not\s+allowed|error/.test(cleanMessage);
   }
   function rememberSkillAsBuff(skill) {
     if (!skill) return;
@@ -5923,7 +6199,16 @@ async function aurelixGetUpdateStatus(force = false) {
       let data = null;
       try { data = JSON.parse(text); } catch (_) {}
       const message = normalizeSpace(data?.message || data?.error || text);
+      updateLiveCombatResources(data);
       if (!res.ok || !data || (data.status && data.status !== 'success')) {
+        if (/\byou\s+are\s+dead\b|\byou\s+died\b|\bplayer\s+is\s+dead\b/i.test(message)) {
+          state.liveResources.hp = 0;
+          invalidateCombatPreflight(target);
+          const recovered = await useEmergencyPotion('hp');
+          if (recovered) return { ok:true, cooldownOnly:true, recoveredHp:true, damage:damageBefore };
+          pushLog('warning', `${skill.name} stopped because the player is dead and no selected HP potion could be used.`);
+          return { ok:false, reason:'player-dead', damage:damageBefore };
+        }
         if (/not enough mana/i.test(message)) {
           const manaNow = currentMana();
           if (allowManaRetry && manaPotionTriggerReached(manaNow) && await useEmergencyPotion('mana', { fillToMax: true })) {
@@ -5975,7 +6260,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const afterMana = parseNumber(data.mana);
       if (Number.isFinite(afterStamina)) state.liveResources.stamina = afterStamina;
       if (Number.isFinite(afterMana)) state.liveResources.mana = afterMana;
-      if (data.retaliation?.user_hp_after != null) state.liveResources.hp = Number(data.retaliation.user_hp_after);
+      updateLiveCombatResources(data);
       updateLiveExpFromAttack(data);
       const spentStamina = Number.isFinite(beforeStamina) && Number.isFinite(afterStamina) ? Math.max(0, beforeStamina - afterStamina) : Math.max(0, Number(skill.staminaDisplayCost) || 0);
       state.session.stats.attacks += 1;
@@ -6141,7 +6426,7 @@ async function aurelixGetUpdateStatus(force = false) {
         invalidateCombatPreflight(target);
         const retryAfter = Number(res.headers.get('Retry-After'));
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 5000;
-        pushLog('warning', `Rate limited by server; waiting ${Math.ceil(waitMs / 1000)}s.`);
+        pushLog('warning', `The server is rate-limiting attacks. Waiting ${Math.ceil(waitMs / 1000)}s before continuing.`);
         await sleep(waitMs);
         const resolved = await resolveUncertainAttack(target, damageBefore);
         return { ok: resolved.resolved, damage: resolved.damage, reason: resolved.resolved ? null : 'rate-limit' };
@@ -6155,7 +6440,16 @@ async function aurelixGetUpdateStatus(force = false) {
       let data = null;
       try { data = JSON.parse(text); } catch (_) {}
       const message = normalizeSpace(data?.message || data?.error || text);
+      updateLiveCombatResources(data);
       if (!res.ok || !data || (data.status && data.status !== 'success')) {
+        if (/\byou\s+are\s+dead\b|\byou\s+died\b|\bplayer\s+is\s+dead\b/i.test(message)) {
+          state.liveResources.hp = 0;
+          invalidateCombatPreflight(target);
+          const recovered = await useEmergencyPotion('hp');
+          if (recovered) return { ok:true, cooldownOnly:true, recoveredHp:true, damage:damageBefore };
+          pushLog('warning', `Attack stopped because the player is dead and no selected HP potion could be used.`);
+          return { ok:false, reason:'player-dead', damage:damageBefore };
+        }
         if (/pvp\s*duel\s*phase|entered\s+a\s+pvp\s+duel\s+phase|defeat\s+that\s+form/i.test(message)) {
           const phaseSnapshot = await combatPreflight(target, true);
           if (phaseSnapshot.phaseDuel) return { ok: false, reason: 'phase-duel', phase: phaseSnapshot.phaseDuel, damage: damageBefore };
@@ -6179,7 +6473,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const hit = Math.max(0, cumulative - damageBefore);
       if (Number.isFinite(parseNumber(data.stamina))) state.liveResources.stamina = parseNumber(data.stamina);
       else state.liveResources.stamina = Math.max(0, currentStamina() - slash.stamina);
-      if (data.retaliation?.user_hp_after != null) state.liveResources.hp = Number(data.retaliation.user_hp_after);
+      updateLiveCombatResources(data);
       updateLiveExpFromAttack(data);
       const critical = responseWasCritical(data);
       const markEffect = updateMarkStateFromResponse(target, data);
@@ -6308,6 +6602,7 @@ async function aurelixGetUpdateStatus(force = false) {
           return;
         }
         state.session.stats.completed += 1;
+        recordCompletedTarget(target);
         if (target.phaseStage === 'phase3') {
           getPhaseProgress(target).stage = 'complete';
           savePhaseRuntime(state.phaseProgress);
@@ -6323,7 +6618,7 @@ async function aurelixGetUpdateStatus(force = false) {
       if (Number.isFinite(hpNow) && hpNow <= 0) {
         const usedPotion = await handleZeroResourceOnce();
         if (usedPotion) continue;
-        pushLog('warning', `HP is 0 for ${target.name}; no usable selected HP potion is available.`);
+        pushLog('warning', `HP reached 0 while fighting ${target.name}. No selected HP potion is currently usable, so combat has stopped.`);
         return;
       }
       let stamina = currentStamina();
@@ -6528,11 +6823,11 @@ async function aurelixGetUpdateStatus(force = false) {
           const now = Date.now();
           if (now - Number(state.lastNetworkWarningAt || 0) >= 10_000) {
             state.lastNetworkWarningAt = now;
-            pushLog('warning', `Network is slow or unavailable; combat will retry in the background (${state.lastError}).`);
+            pushLog('warning', `The server is responding slowly. Combat is paused briefly and will retry automatically. (${state.lastError})`);
           }
           try { await sleep(Math.min(4_000, 500 * (2 ** (state.consecutiveNetworkFailures - 1)))); } catch (_) { break; }
         } else {
-          pushLog('error', `Combat controller error: ${state.lastError}`);
+          pushLog('error', `Combat could not continue because of an unexpected error: ${state.lastError}`);
           try { await sleep(500); } catch (_) { break; }
         }
       }
@@ -6555,6 +6850,7 @@ async function aurelixGetUpdateStatus(force = false) {
       startedAt: new Date().toISOString(),
       stoppedAt: null,
       elapsedBeforeStopMs: 0,
+      completedTargets: {},
       stats: {
         completed: 0,
         attacks: 0,
@@ -6609,7 +6905,7 @@ async function aurelixGetUpdateStatus(force = false) {
     state.abortController?.abort();
     state.abortController = new AbortController();
     resetSession();
-    pushLog('start', 'Automation session started.');
+    pushLog('start', 'AURELIX started. Preparing the first target.');
     state.status = ENGINE_STATES.RUNNING;
     state.liveResources = clone(window.AURELIX?.getReport?.()?.resources?.player || {});
     syncLegacyPresets();
@@ -6643,7 +6939,7 @@ async function aurelixGetUpdateStatus(force = false) {
     state.currentTarget = null;
     state.currentPlan = null;
     state.status = ENGINE_STATES.OFF;
-    pushLog('stop', 'Automation session stopped.');
+    pushLog('stop', 'AURELIX stopped.');
     emit();
     return getRuntimeState();
   }
@@ -6651,7 +6947,7 @@ async function aurelixGetUpdateStatus(force = false) {
     if (state.status !== ENGINE_STATES.RUNNING) return getRuntimeState();
     state.status = ENGINE_STATES.PAUSED;
     state.abortController?.abort();
-    pushLog('system', 'Automation paused.');
+    pushLog('system', 'AURELIX paused.');
     emit();
     return getRuntimeState();
   }
@@ -6661,7 +6957,7 @@ async function aurelixGetUpdateStatus(force = false) {
     state.abortController = new AbortController();
     decideNow();
     ensureCombatLoop();
-    pushLog('system', 'Automation resumed.');
+    pushLog('system', 'AURELIX resumed.');
     emit();
     return getRuntimeState();
   }
@@ -6685,6 +6981,7 @@ async function aurelixGetUpdateStatus(force = false) {
       stoppedAt: state.session.stoppedAt,
       elapsedMs: runtimeElapsedMs(),
       summary: clone(state.session.stats),
+      completedTargets: clone(state.session.completedTargets || {}),
       resources: { ...clone(window.AURELIX?.getReport?.()?.resources?.player || {}), ...clone(state.liveResources) },
       currentTarget: clone(state.currentTarget),
       currentPlan: clone(state.currentPlan),
@@ -6814,7 +7111,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const VERSION = '0.5.72';
+  const VERSION = '0.5.74';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
@@ -7094,6 +7391,15 @@ async function aurelixGetUpdateStatus(force = false) {
   #aurelix-ui .ax-summary-row span { color: var(--ax-muted); }
   #aurelix-ui .ax-summary-row b { color: #fff; font-family: monospace; }
   #aurelix-ui .ax-summary-row:first-child b { color: var(--ax-gold); }
+  #aurelix-ui .ax-summary-row.ax-summary-clickable { cursor:pointer; border-radius:7px; padding:6px 7px; margin:0 -7px; transition:background .15s ease,border-color .15s ease; }
+  #aurelix-ui .ax-summary-row.ax-summary-clickable:hover { background:rgba(255,255,255,.055); }
+  #aurelix-ui .ax-summary-row.ax-summary-clickable span::after { content:' ›'; color:var(--ax-gold); font-weight:800; }
+  #aurelix-ui .ax-summary-detail { display:none; margin:-2px 0 5px; padding:9px 10px; border:1px solid rgba(255,255,255,.07); border-radius:8px; background:rgba(0,0,0,.18); max-height:180px; overflow:auto; font-size:calc(11px * var(--ax-scale)); }
+  #aurelix-ui .ax-summary-detail.open { display:block; }
+  #aurelix-ui .ax-summary-detail-row { display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid rgba(255,255,255,.045); }
+  #aurelix-ui .ax-summary-detail-row:last-child { border-bottom:0; }
+  #aurelix-ui .ax-summary-detail-time { color:var(--ax-muted); font-family:monospace; white-space:nowrap; }
+  #aurelix-ui .ax-summary-empty { color:var(--ax-muted); padding:3px 0; }
 
   /* Shared Form Elements */
   .ax-num, .ax-search, #aurelix-ui .ax-select, #aurelix-ui .ax-range { width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--ax-line); background: rgba(0,0,0,0.3); color: #fff; font-family: inherit; font-size: calc(13px * var(--ax-scale)); min-height: 42px; outline: none; transition: border-color 0.2s; }
@@ -7375,7 +7681,8 @@ async function aurelixGetUpdateStatus(force = false) {
               </div>
               <div class="ax-summary-body">
                 <div class="ax-summary-row"><span>Runtime</span><b id="ax-sum-runtime">00:00:00</b></div>
-                <div class="ax-summary-row"><span>Targets Completed</span><b id="ax-sum-completed">0</b></div>
+                <div class="ax-summary-row ax-summary-clickable" id="ax-summary-completed-row" role="button" tabindex="0" aria-expanded="false"><span>Targets Completed</span><b id="ax-sum-completed">0</b></div>
+                <div class="ax-summary-detail" id="ax-summary-completed-detail"></div>
                 <div class="ax-summary-row"><span>Total Attacks</span><b id="ax-sum-attacks">0</b></div>
                 <div class="ax-summary-row"><span>Total Damage</span><b id="ax-sum-damage">0</b></div>
                 <div class="ax-summary-row"><span>Stamina Used</span><b id="ax-sum-stamina">0</b></div>
@@ -7384,9 +7691,9 @@ async function aurelixGetUpdateStatus(force = false) {
                 <div class="ax-summary-row"><span>Stamina Potions</span><b id="ax-sum-stamina-potions">0</b></div>
                 <div class="ax-summary-row"><span>Mana Potions</span><b id="ax-sum-mana-potions">0</b></div>
                 <div class="ax-summary-row"><span>Mobs Looted</span><b id="ax-sum-mobs-looted">0</b></div>
-                <div class="ax-summary-row"><span>Mobs Unlooted</span><b id="ax-sum-mobs-unlooted">0</b></div>
                 <div class="ax-summary-row"><span>XP Looted</span><b id="ax-sum-xp-loot">0</b></div>
-                <div class="ax-summary-row"><span>Errors</span><b id="ax-sum-errors" style="color:var(--ax-red)">0</b></div>
+                <div class="ax-summary-row ax-summary-clickable" id="ax-summary-errors-row" role="button" tabindex="0" aria-expanded="false"><span>Errors</span><b id="ax-sum-errors" style="color:var(--ax-red)">0</b></div>
+                <div class="ax-summary-detail" id="ax-summary-errors-detail"></div>
               </div>
             </article>
           </div>
@@ -7474,12 +7781,12 @@ async function aurelixGetUpdateStatus(force = false) {
           </div>
         </section>
         <section class="ax-view" data-view="presets">
-          <div style="display:grid; gap:16px;">
-            <div style="display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-bottom:12px;">
+          <div class="ax-presets-shell">
+            <div class="ax-preset-nav">
               <button class="ax-choice-btn active" data-preset-subview="manager" type="button">🎒 Preset Manager</button>
               <button class="ax-choice-btn" data-preset-subview="assignments" type="button">🎯 Monster Assignments</button>
             </div>
-            <div class="ax-preset-subview active" data-preset-panel="manager">
+            <div class="ax-preset-subview active ax-preset-manager" data-preset-panel="manager">
             <article class="ax-card">
               <div class="ax-card-head"><h3>🛠️ Loadout Controller</h3></div>
               <div class="ax-card-pad">
@@ -7525,7 +7832,7 @@ async function aurelixGetUpdateStatus(force = false) {
               </div>
             </article>
             </div>
-            <div class="ax-preset-subview" data-preset-panel="assignments">
+            <div class="ax-preset-subview ax-preset-assignments" data-preset-panel="assignments">
             <article class="ax-card">
               <div class="ax-card-head"><h3>🎯 Monster Assignments</h3></div>
               <div class="ax-card-pad">
@@ -7606,9 +7913,9 @@ async function aurelixGetUpdateStatus(force = false) {
             </article>
           </div>
         </section>
-        <section class="ax-view" data-view="updates">
+        <section class="ax-view ax-updates-view" data-view="updates">
 
-  <div class="ax-card">
+  <div class="ax-card ax-update-main-card">
     <div class="ax-card-head">
       <div>
         <div class="ax-card-title">🚀 AURELIX Update Center</div>
@@ -7652,7 +7959,6 @@ async function aurelixGetUpdateStatus(force = false) {
 
       </div>
 
-
       <div class="ax-update-status" id="ax-update-status">
         <div class="ax-update-status-icon">◌</div>
 
@@ -7666,7 +7972,6 @@ async function aurelixGetUpdateStatus(force = false) {
           </div>
         </div>
       </div>
-
 
       <div class="ax-update-actions">
 
@@ -7692,8 +7997,7 @@ async function aurelixGetUpdateStatus(force = false) {
     </div>
   </div>
 
-
-  <div class="ax-card">
+  <div class="ax-card ax-update-release-card">
     <div class="ax-card-head">
       <div>
         <div class="ax-card-title">📋 What's New</div>
@@ -7717,8 +8021,7 @@ async function aurelixGetUpdateStatus(force = false) {
     </div>
   </div>
 
-
-  <div class="ax-card">
+  <div class="ax-card ax-update-channel-card">
     <div class="ax-card-head">
       <div>
         <div class="ax-card-title">⚡ Release Channel</div>
@@ -7764,6 +8067,65 @@ async function aurelixGetUpdateStatus(force = false) {
         <span id="ax-footer-right">Scanner: waiting</span>
       </footer>
     </div>
+/* Preset workspace refinement — layout only; existing preset logic/hooks unchanged. */
+#aurelix-ui .ax-presets-shell { display:grid; gap:18px; }
+#aurelix-ui .ax-preset-nav { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; padding:0; border:0; border-radius:0; background:transparent; width:100%; }
+#aurelix-ui .ax-preset-nav .ax-choice-btn { width:100%; min-width:0; min-height:42px; padding:10px 16px; border:1px solid var(--ax-line); border-radius:6px; background:rgba(0,0,0,.2); color:var(--ax-muted); }
+#aurelix-ui .ax-preset-nav .ax-choice-btn.active { background:rgba(255,255,255,.08); border-color:var(--ax-cyan); color:var(--ax-cyan); box-shadow:none; }
+#aurelix-ui .ax-preset-subview { display:none; }
+#aurelix-ui .ax-preset-subview.active { display:grid; gap:18px; }
+#aurelix-ui .ax-preset-manager > .ax-card:first-child { margin-bottom:0; }
+#aurelix-ui .ax-preset-manager > div[style*="grid-template-columns"] { gap:16px !important; margin-top:0 !important; }
+#aurelix-ui .ax-preset-manager .ax-card-pad, #aurelix-ui .ax-preset-assignments .ax-card-pad { padding:16px; }
+#aurelix-ui .ax-preset-toolbar { gap:10px; margin-bottom:14px; }
+#aurelix-ui .ax-preset-toolbar .ax-search { min-width:190px; }
+#aurelix-ui .ax-preset-card { grid-template-columns:minmax(0,1fr); gap:10px; padding:12px 13px; margin-bottom:10px; border-radius:9px; }
+#aurelix-ui .ax-preset-card.is-active { border-width:1px; box-shadow:0 0 0 1px var(--ax-cyan),0 0 12px color-mix(in srgb,var(--ax-cyan) 24%,transparent); }
+#aurelix-ui .ax-preset-card .ax-preset-rename { min-height:36px; padding:7px 9px; }
+#aurelix-ui .ax-preset-card small { color:var(--ax-muted); font-size:calc(10.5px * var(--ax-scale)); }
+#aurelix-ui .ax-preset-actions { display:flex; flex-wrap:wrap; justify-content:flex-start; gap:6px; padding-top:8px; border-top:1px solid rgba(255,255,255,.055); }
+#aurelix-ui .ax-preset-actions .ax-mini-action { min-width:36px; min-height:34px; padding:6px 9px; }
+#aurelix-ui .ax-preset-assignments .ax-card { border-color:color-mix(in srgb,var(--ax-cyan) 20%,var(--ax-line)); }
+#aurelix-ui .ax-preset-assignments #ax-loadout-assignments { margin-top:14px; }
+#aurelix-ui .ax-preset-assignments .ax-assignment-row { margin-bottom:10px; padding:13px; }
+@media (max-width:760px){
+  #aurelix-ui .ax-preset-manager > div[style*="grid-template-columns"] { grid-template-columns:1fr !important; }
+  #aurelix-ui .ax-preset-nav { grid-template-columns:1fr 1fr; }
+}
+
+/* Update workspace refinement — status/update logic unchanged. */
+#aurelix-ui .ax-updates-view { display:none; gap:14px; }
+#aurelix-ui .ax-updates-view.active { display:grid; }
+#aurelix-ui .ax-updates-view .ax-card { margin:0; }
+#aurelix-ui .ax-update-main-card .ax-card-pad { display:grid; grid-template-columns:minmax(0,1fr) minmax(240px,.72fr); gap:12px 16px; align-items:stretch; }
+#aurelix-ui .ax-update-main-card .ax-update-version-grid { grid-column:1; grid-row:1; margin:0; }
+#aurelix-ui .ax-update-main-card .ax-update-status { grid-column:2; grid-row:1; margin:0; }
+#aurelix-ui .ax-update-main-card .ax-update-actions { grid-column:1/-1; grid-row:2; }
+#aurelix-ui .ax-update-version-grid { grid-template-columns:1fr auto 1fr; gap:8px; }
+#aurelix-ui .ax-update-version-box { padding:11px 12px; border-radius:9px; border-color:var(--ax-line); background:rgba(255,255,255,.018); }
+#aurelix-ui .ax-update-label { margin-bottom:4px; font-size:9px; letter-spacing:.8px; }
+#aurelix-ui .ax-update-version { font-size:17px; }
+#aurelix-ui .ax-update-arrow { font-size:16px; }
+#aurelix-ui .ax-update-status { min-height:100%; padding:11px 12px; border-radius:9px; border-color:var(--ax-line); background:rgba(255,255,255,.018); }
+#aurelix-ui .ax-update-status-icon { width:30px; height:30px; flex-basis:30px; border-radius:8px; font-size:15px; }
+#aurelix-ui .ax-update-status-title { font-size:11px; }
+#aurelix-ui .ax-update-status-sub { font-size:10px; }
+#aurelix-ui .ax-update-actions { gap:8px; }
+#aurelix-ui .ax-update-actions .ax-btn { flex:0 1 auto; min-width:150px; }
+#aurelix-ui .ax-update-release-card .ax-card-pad { padding-top:12px; }
+#aurelix-ui .ax-update-changelog { gap:6px; }
+#aurelix-ui .ax-update-change { padding:8px 10px 8px 27px; border-radius:8px; }
+#aurelix-ui .ax-update-change::before { left:9px; top:8px; }
+#aurelix-ui .ax-update-channel-card .ax-card-pad { padding:10px 14px 14px; }
+#aurelix-ui .ax-update-details { grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+#aurelix-ui .ax-update-details > div { display:grid; gap:3px; align-content:center; padding:9px 10px; border-radius:8px; }
+#aurelix-ui .ax-update-details span, #aurelix-ui .ax-update-details strong { display:block; }
+@media (max-width:760px){
+  #aurelix-ui .ax-update-main-card .ax-card-pad { grid-template-columns:1fr; }
+  #aurelix-ui .ax-update-main-card .ax-update-version-grid, #aurelix-ui .ax-update-main-card .ax-update-status, #aurelix-ui .ax-update-main-card .ax-update-actions { grid-column:1; grid-row:auto; }
+  #aurelix-ui .ax-update-details { grid-template-columns:1fr; }
+}
+
 /* =========================================================
    AURELIX UPDATE CENTER
    ========================================================= */
@@ -7986,6 +8348,7 @@ async function aurelixGetUpdateStatus(force = false) {
       stamina: null, staminaMax: null,
       exp: null, expMax: null
     },
+    completedTargets: {},
     summary: {
       completed: 0,
       attacks: 0,
@@ -7996,7 +8359,6 @@ async function aurelixGetUpdateStatus(force = false) {
       staminaPotions: 0,
       manaPotions: 0,
       mobsLooted: 0,
-      mobsUnlooted: 0,
       xpLooted: 0,
       errors: 0
     },
@@ -8022,6 +8384,34 @@ async function aurelixGetUpdateStatus(force = false) {
   function setBar(id, value) {
     const el = $(id);
     if (el) el.style.width = `${clamp(value,0,100)}%`;
+  }
+  function renderSummaryDetails() {
+    const completed = $('#ax-summary-completed-detail');
+    if (completed) {
+      const entries = Object.entries(appState.completedTargets || {}).sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      completed.innerHTML = entries.length
+        ? entries.map(([name,count]) => `<div class="ax-summary-detail-row"><span>${safe(displayTargetName(name))}</span><b>×${fmt(count)}</b></div>`).join('')
+        : '<div class="ax-summary-empty">No targets completed in this session yet.</div>';
+    }
+    const errors = $('#ax-summary-errors-detail');
+    if (errors) {
+      const issues = (appState.logs || []).filter(x => x && (x.type === 'error' || x.type === 'warning')).slice(-30).reverse();
+      errors.innerHTML = issues.length
+        ? issues.map(x => {
+            const d = new Date(x.at || Date.now());
+            const time = Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+            return `<div class="ax-summary-detail-row"><span>${safe(x.message || 'Unknown error')}</span><span class="ax-summary-detail-time">${safe(time)}</span></div>`;
+          }).join('')
+        : '<div class="ax-summary-empty">No errors recorded in this session.</div>';
+    }
+  }
+  function toggleSummaryDetail(rowId, detailId) {
+    const row = $(rowId), detail = $(detailId);
+    if (!row || !detail) return;
+    const open = !detail.classList.contains('open');
+    detail.classList.toggle('open', open);
+    row.setAttribute('aria-expanded', String(open));
+    if (open) renderSummaryDetails();
   }
   function renderOverview() {
     const t = appState.currentTarget;
@@ -8076,9 +8466,9 @@ async function aurelixGetUpdateStatus(force = false) {
     $('#ax-sum-stamina-potions').textContent = fmt(appState.summary.staminaPotions);
     $('#ax-sum-mana-potions').textContent = fmt(appState.summary.manaPotions);
     $('#ax-sum-mobs-looted').textContent = fmt(appState.summary.mobsLooted);
-    $('#ax-sum-mobs-unlooted').textContent = fmt(appState.summary.mobsUnlooted);
     $('#ax-sum-xp-loot').textContent = fmt(appState.summary.xpLooted);
     $('#ax-sum-errors').textContent = fmt(appState.summary.errors);
+    renderSummaryDetails();
 
     const toggleBtn = $('#ax-engine-toggle');
     toggleBtn.textContent = appState.running ? '🛑 Stop Engine' : '🚀 Start Engine';
@@ -8300,13 +8690,22 @@ async function aurelixGetUpdateStatus(force = false) {
       return card(p, 'equipment', String(active.equipmentPresetId || '') === String(p.id), `${gear} gear • ${crystals} crystals`);
     }).join('') : `<div class="ax-setting-copy"><small>No PvE equipment presets. Import existing presets or save the equipped setup.</small></div>`;
     petBox.innerHTML = pets.length ? pets.map(p => {
-      let mains = 0, links = 0;
+      let mains = 0, links = 0, attachments = 0;
       for (let slot=1; slot<=3; slot++) {
         const cfg = p.slots?.[slot] || p.slots?.[String(slot)];
-        if (cfg?.main?.id) mains++;
-        for (let level=1; level<=2; level++) if (cfg?.links?.[level]?.id || cfg?.links?.[String(level)]?.id) links++;
+        if (cfg?.main?.id) {
+          mains++;
+          if (cfg.main.attachmentsCaptured === true) attachments += ['attack','defense','elemental'].filter(type => cfg.main.attachments?.[type]).length;
+        }
+        for (let level=1; level<=2; level++) {
+          const linked = cfg?.links?.[level] || cfg?.links?.[String(level)];
+          if (linked?.id) {
+            links++;
+            if (linked.attachmentsCaptured === true) attachments += ['attack','defense','elemental'].filter(type => linked.attachments?.[type]).length;
+          }
+        }
       }
-      return card(p, 'pet', String(active.petPresetId || '') === String(p.id), `${mains} main pets • ${links} links`);
+      return card(p, 'pet', String(active.petPresetId || '') === String(p.id), `${mains} main pets • ${links} links • ${attachments} sigils/orbs`);
     }).join('') : `<div class="ax-setting-copy"><small>No PvE pet presets. Import existing presets or save the equipped formation.</small></div>`;
     const status = $('#ax-loadout-status');
     if (status) {
@@ -8844,7 +9243,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       ? String(release.channel).toUpperCase()
       : 'STABLE';
 
-
   if (Array.isArray(release.changelog) && release.changelog.length) {
     changelog.innerHTML = '';
 
@@ -8863,7 +9261,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       </div>
     `;
   }
-
 
   if (release.version) {
     const parts = [];
@@ -8884,7 +9281,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
     releaseInfo.textContent =
       'Release information will appear after checking for updates.';
   }
-
 
   switch (state.status) {
 
@@ -8911,7 +9307,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       installButton.disabled = true;
       break;
 
-
     case 'current':
       badge.textContent = 'UP TO DATE';
 
@@ -8935,7 +9330,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       installButton.disabled = true;
       break;
 
-
     case 'available':
       badge.textContent = 'UPDATE AVAILABLE';
 
@@ -8958,7 +9352,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
 
       installButton.disabled = false;
       break;
-
 
     case 'error': {
       badge.textContent = 'CHECK FAILED';
@@ -8990,7 +9383,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       break;
     }
 
-
     default:
       badge.textContent = 'NOT CHECKED';
 
@@ -9015,7 +9407,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       break;
   }
 }
-
 
 $('#ax-update-check')?.addEventListener('click', async () => {
 
@@ -9429,6 +9820,7 @@ renderAurelixUpdateCenter();
           };
         } else appState.currentTarget = null;
         if (runtime.summary) Object.assign(appState.summary, runtime.summary);
+        if (runtime.completedTargets) appState.completedTargets = { ...runtime.completedTargets };
         if (runtime.activeLoadout || typeof runtime.loadoutInFlight === 'boolean') {
           const nextActive = runtime.activeLoadout || appState.loadouts.active;
           const nextBusy = !!runtime.loadoutInFlight;
@@ -9516,6 +9908,11 @@ renderAurelixUpdateCenter();
       mini.classList.toggle('ax-running', appState.running);
       if (root.style.display !== 'none' && isViewActive('overview')) renderOverview();
     } catch (error) { console.error('[AURELIX UI] runtime sync failed', error); }
+  }
+  for (const [rowId, detailId] of [['#ax-summary-completed-row','#ax-summary-completed-detail'],['#ax-summary-errors-row','#ax-summary-errors-detail']]) {
+    const row = $(rowId);
+    row?.addEventListener('click', () => toggleSummaryDetail(rowId, detailId));
+    row?.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleSummaryDetail(rowId, detailId); } });
   }
   loadPreferences();
   bindPreferences();
