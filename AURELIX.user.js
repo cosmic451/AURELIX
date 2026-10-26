@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.5.74
+// @version      0.6.4
 // @description  AURELIX automation engine with smart combat, presets, resource recovery, auto loot, and adaptive targeting.
 // @icon         https://raw.githubusercontent.com/cosmic451/afb-assets/main/aurelixauto.png
 // @match        https://demonicscans.org/*
@@ -11,16 +11,66 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
 // @connect      raw.githubusercontent.com
 // @run-at       document-end
 // ==/UserScript==
+
+/* AURELIX DIAGNOSTIC v4.1 — bounded, passive, self-instrumentation. */
+const AURELIX_TRACE = (() => {
+  const events = [];
+  const MAX = 350;
+  let seq = 0;
+  const clean = value => String(value ?? '').slice(0, 240)
+    .replace(/https?:\/\/[^\s]+/gi, m => { try { return new URL(m).pathname; } catch (_) { return '[URL]'; } })
+    .replace(/(?:token|csrf|secret|password|cookie|authorization|intent|session)\s*[:=]\s*[^\s,;]+/gi, '[REDACTED]');
+  function record(kind, data = {}) {
+    try {
+      const e = { id: ++seq, at: new Date().toISOString(), kind: clean(kind) };
+      for (const [key, value] of Object.entries(data)) {
+        if (/token|csrf|secret|password|cookie|authorization|intent|session|body|html|payload|headers/i.test(key)) continue;
+        if (typeof value === 'number' && Number.isFinite(value)) e[key] = Math.round(value);
+        else if (typeof value === 'boolean') e[key] = value;
+        else if (typeof value === 'string') e[key] = clean(value);
+      }
+      events.push(e);
+      if (events.length > MAX) events.splice(0, events.length - MAX);
+    } catch (_) {}
+  }
+  function analyze() {
+    const findings = [];
+    const network = events.filter(e => e.kind === 'request');
+    const failures = network.filter(e => e.failed || (e.status && e.status >= 400));
+    const slow = network.filter(e => e.ms >= 1800);
+    const rate = failures.filter(e => e.status === 429);
+    const timeouts = failures.filter(e => /timed out|abort/i.test(e.error || ''));
+    const groups = {};
+    for (const e of network) {
+      const key = `${e.method || 'GET'} ${e.path || 'unknown'}`;
+      const g = groups[key] ||= { count:0, failures:0, totalMs:0, maxMs:0, statuses:{} };
+      g.count++; g.failures += Number(!!e.failed || (e.status >= 400));
+      g.totalMs += e.ms || 0; g.maxMs = Math.max(g.maxMs, e.ms || 0);
+      if (e.status) g.statuses[e.status] = (g.statuses[e.status] || 0) + 1;
+    }
+    const endpoints = Object.entries(groups).map(([endpoint,g]) => ({ endpoint, count:g.count, failures:g.failures, avgMs:Math.round(g.totalMs/g.count), maxMs:g.maxMs, statuses:g.statuses })).sort((a,b)=>b.failures-a.failures || b.avgMs-a.avgMs).slice(0,35);
+    if (rate.length) findings.push({ category:'network', cause:'HTTP 429: server rate limiting confirmed', confidence:'confirmed', evidenceIds:rate.slice(-8).map(e=>e.id), advice:'Keep server backoff; reduce request pressure or concurrency rather than disabling safeguards.' });
+    if (timeouts.length) findings.push({ category:'network', cause:'Requests exceeded timeout or were aborted', confidence:'confirmed symptom; upstream cause unknown', evidenceIds:timeouts.slice(-8).map(e=>e.id), advice:'Compare endpoint latency and scheduler wait; check server availability and connection.' });
+    if (slow.length) findings.push({ category:'performance', cause:'Slow network operations observed', confidence:'confirmed symptom', evidenceIds:slow.slice(-8).map(e=>e.id), advice:'Inspect the slowest endpoints and separate queue wait from request duration.' });
+    const js = events.filter(e=>e.kind==='exception' || e.kind==='unhandled-rejection');
+    if (js.length) findings.push({category:'javascript',cause:'Captured runtime exception or unhandled promise rejection',confidence:'confirmed exception; origin may be another script',evidenceIds:js.slice(-8).map(e=>e.id),advice:'Inspect sanitized message, source and stack; correlate with adjacent engine events.'});
+    return { version:'4.0', mode:'passive instrumentation; no diagnostic network requests', eventCount:events.length, droppedEvents:Math.max(0,seq-events.length), endpoints, findings, recentEvents:events.slice(-200) };
+  }
+  window.addEventListener('error', e => record('exception', {message:e.message || 'Script error', source:e.filename ? (()=>{try{return new URL(e.filename).pathname}catch(_){return 'unknown'}})():'unknown', line:e.lineno, column:e.colno, stack:e.error?.stack}));
+  window.addEventListener('unhandledrejection', e => record('unhandled-rejection', {message:e.reason?.message || String(e.reason),stack:e.reason?.stack}));
+  return Object.freeze({record, analyze});
+})();
 
 /* =========================================================
    AURELIX UPDATE SYSTEM
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.5.74',
+  currentVersion: '0.6.4',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -132,12 +182,92 @@ GM_xmlhttpRequest({
 
   });
 }
+
+function aurelixTrustedUpdateURL(release = AURELIX_UPDATE_STATE.release) {
+  const raw = release?.download_url || AURELIX_UPDATE.downloadURL;
+  const url = new URL(raw, location.href);
+
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'raw.githubusercontent.com' ||
+    !url.pathname.startsWith('/cosmic451/AURELIX/') ||
+    !/AURELIX\.user\.js$/i.test(url.pathname)
+  ) {
+    throw new Error('Release does not point to the trusted AURELIX.user.js installer.');
+  }
+
+  return url.href;
+}
+
+function aurelixVerifyInstaller(url, expectedVersion) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method:'GET',
+      url:`${url}${url.includes('?') ? '&' : '?'}_aurelix_verify=${Date.now()}`,
+      headers:{
+        'Cache-Control':'no-cache, no-store, must-revalidate',
+        'Pragma':'no-cache'
+      },
+      timeout:12000,
+
+      onload(response) {
+        try {
+          if (response.status < 200 || response.status >= 300) {
+            throw new Error(`Installer returned HTTP ${response.status}.`);
+          }
+
+          const text = String(response.responseText || '');
+
+          if (!text.includes('// ==UserScript==')) {
+            throw new Error('Downloaded update is not a userscript.');
+          }
+
+          if (!/@name\s+AURELIX Auto Engine\b/.test(text)) {
+            throw new Error('Downloaded userscript is not AURELIX Auto Engine.');
+          }
+
+          const versionMatch = text.match(/@version\s+([^\s]+)/);
+          const installerVersion = versionMatch?.[1]?.trim() || '';
+
+          if (!installerVersion) {
+            throw new Error('Installer @version is missing.');
+          }
+
+          if (
+            expectedVersion &&
+            aurelixCompareVersions(installerVersion, expectedVersion) !== 0
+          ) {
+            throw new Error(
+              `Installer version ${installerVersion} does not match published release ${expectedVersion}.`
+            );
+          }
+
+          resolve({
+            version: installerVersion,
+            bytes: text.length
+          });
+        } catch (error) {
+          reject(error);
+        }
+      },
+
+      onerror() {
+        reject(new Error('Unable to download the installer for verification.'));
+      },
+
+      ontimeout() {
+        reject(new Error('Installer verification timed out.'));
+      }
+    });
+  });
+}
+
 /* =========================================================
    AURELIX UPDATE STATE
    ========================================================= */
 
 const AURELIX_UPDATE_STATE = {
-  status: 'idle',          // idle | checking | current | available | error
+  status: 'idle',          // idle | checking | current | ahead | available | error
   currentVersion: AURELIX_UPDATE.currentVersion,
   latestVersion: null,
   release: null,
@@ -147,12 +277,10 @@ const AURELIX_UPDATE_STATE = {
 };
 
 async function aurelixGetUpdateStatus(force = false) {
-  // Reuse an active request instead of creating duplicates.
   if (AURELIX_UPDATE_STATE.request) {
     return AURELIX_UPDATE_STATE.request;
   }
 
-  // Reuse a successful result for 10 minutes unless manually forced.
   const cacheAge =
     Date.now() - (AURELIX_UPDATE_STATE.checkedAt || 0);
 
@@ -183,10 +311,17 @@ async function aurelixGetUpdateStatus(force = false) {
       AURELIX_UPDATE_STATE.checkedAt =
         result.checkedAt;
 
+      const versionOrder = aurelixCompareVersions(
+        result.latestVersion,
+        result.currentVersion
+      );
+
       AURELIX_UPDATE_STATE.status =
-        result.updateAvailable
+        versionOrder > 0
           ? 'available'
-          : 'current';
+          : versionOrder < 0
+            ? 'ahead'
+            : 'current';
 
       return AURELIX_UPDATE_STATE;
 
@@ -208,13 +343,15 @@ async function aurelixGetUpdateStatus(force = false) {
 }
 (() => {
   'use strict';
-  const VERSION = '0.3.0';
+  const VERSION = '4.0.0';
   const ORIGIN = location.origin;
   const CONFIG = {
     autoStart: true,
     scanIntervalMs: 10 * 60_000,
     requestDelayMs: 25,
     requestTimeoutMs: 15_000,
+    scannerTimeoutRetryCount: 1,
+    scannerWaveConcurrency: 3,
     maxGatePages: 50,
     maxHubPages: 20,
     maxDungeonInstances: 10,
@@ -242,7 +379,9 @@ async function aurelixGetUpdateStatus(force = false) {
     lastScanFinishedAt: null,
     lastReport: null,
     requestLog: [],
-    errors: []
+    errors: [],
+    pageCache: new Map(),
+    cacheHits: 0
   };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   function log(...args) {
@@ -497,13 +636,23 @@ async function aurelixGetUpdateStatus(force = false) {
   async function getPage(urlLike, purpose = 'scan', options = {}) {
     const url = safeUrl(urlLike);
     if (!url || !sameOrigin(url)) throw new Error(`Refusing non-same-origin URL: ${urlLike}`);
+    const cacheable = !options.cookieOverrides;
+    const ttlMs = Number.isFinite(Number(options.ttlMs))
+      ? Math.max(0, Number(options.ttlMs))
+      : (/bootstrap|gate-hub|dungeon-entry/i.test(purpose) ? 4000 : /location|gate-wave/i.test(purpose) ? 1200 : 800);
+    const cacheKey = cacheable ? `${purpose}|${url}` : null;
+    const cached = cacheKey ? state.pageCache.get(cacheKey) : null;
+    if (cached && Date.now() - cached.at <= ttlMs) {
+      state.cacheHits += 1;
+      return cached.value;
+    }
     await sleep(CONFIG.requestDelayMs);
     const controller = new AbortController();
     const externalSignal = state.scanController?.signal || null;
     const abortFromExternal = () => controller.abort(externalSignal?.reason);
     if (externalSignal?.aborted) abortFromExternal();
     else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
-    const timeout = setTimeout(() => controller.abort(), CONFIG.requestTimeoutMs);
+    const timeout = setTimeout(() => controller.abort(new DOMException('Scanner request timed out', 'TimeoutError')), CONFIG.requestTimeoutMs);
     const started = Date.now();
     try {
       const request = async () => fetch(url, {
@@ -518,9 +667,13 @@ async function aurelixGetUpdateStatus(force = false) {
       });
       let res;
       for (let attempt = 0; ; attempt += 1) {
-        res = options.cookieOverrides
-          ? await withCookieOverrides(options.cookieOverrides, request)
-          : await request();
+        try {
+          res = options.cookieOverrides
+            ? await withCookieOverrides(options.cookieOverrides, request)
+            : await request();
+        } catch (error) {
+          throw error;
+        }
         if (attempt >= 2 || !TRANSIENT_SCAN_STATUSES.has(Number(res.status))) break;
         try { await res.body?.cancel?.(); } catch (_) {}
         await sleep(attempt === 0 ? 500 : 1200);
@@ -541,10 +694,22 @@ async function aurelixGetUpdateStatus(force = false) {
         populationView: options.populationView || null,
         cookieOverrideNames: options.cookieOverrides ? Object.keys(options.cookieOverrides) : []
       };
+      AURELIX_TRACE.record('request', {source:'scanner', method:'GET', path:new URL(url).pathname, purpose, status:res.status, ms:rec.ms, failed:!res.ok});
       state.requestLog.push(rec);
       if (state.requestLog.length > 60) state.requestLog.splice(0, state.requestLog.length - 60);
       if (!res.ok && !options.allowHttpErrors) throw new Error(`GET ${url} -> HTTP ${res.status}`);
-      return { url, finalUrl: res.url, html, doc, status: res.status, ok: res.ok };
+      const value = { url, finalUrl: res.url, html, doc, status: res.status, ok: res.ok };
+      if (cacheKey && res.ok) {
+        state.pageCache.set(cacheKey, { at:Date.now(), value: { ...value, html: '' } });
+        if (state.pageCache.size > 80) {
+          const oldest = state.pageCache.keys().next().value;
+          state.pageCache.delete(oldest);
+        }
+      }
+      return value;
+    } catch (error) {
+      AURELIX_TRACE.record('request', {source:'scanner', method:'GET', path:new URL(url).pathname, purpose, ms:Date.now()-started, failed:true, error:error?.message || String(error)});
+      throw error;
     } finally {
       clearTimeout(timeout);
       externalSignal?.removeEventListener?.('abort', abortFromExternal);
@@ -917,6 +1082,7 @@ async function aurelixGetUpdateStatus(force = false) {
       node.isRevealed && !node.isCleared &&
       (node.status === 'available' || node.status === 'in_progress')
     );
+    const locationJobs = [];
     for (const node of dungeon.nodes) {
       const locationId = node.linkedLocationId;
       const hasCombatLocation = locationId != null && locationId > 0;
@@ -945,6 +1111,7 @@ async function aurelixGetUpdateStatus(force = false) {
       };
       locations.push(location);
       if (!hasCombatLocation || status !== 'available' && status !== 'in_progress' || !location.url) continue;
+      locationJobs.push(async () => {
       try {
         const locPage = await getPage(location.url, `cube-location:${seed.instanceId}:${locationId}`);
         const detail = parseDungeonLocation(locPage.doc, {
@@ -959,68 +1126,73 @@ async function aurelixGetUpdateStatus(force = false) {
       } catch (e) {
         state.errors.push({ at: nowIso(), stage: 'cube-location', instanceId: seed.instanceId, nodeId: node.nodeId, locationId, message: String(e?.message || e) });
       }
+      });
     }
+    await mapWithConcurrency(locationJobs, Math.min(3, CONFIG.maxDungeonLocationConcurrency), job => job());
     dungeon.actionableNodeIds = actionable.map(n => n.nodeId);
     return { locations, entities };
   }
-  function collectGateWaveLinks(doc, sourceUrl = location.href, expectedGateId = null) {
+  function gateNavigationCandidates(doc) {
     const out = [];
-    const candidates = [];
-    const pushCandidate = (href, label = '', className = '', origin = 'attribute') => {
-      if (!href || !/active_wave\.php/i.test(href)) return;
-      candidates.push({ href: String(href), label, className, origin });
+    const add = (value, label = '', cls = '', origin = '') => {
+      if (typeof value !== 'string' || !value) return;
+      const decoded = value.replace(/&amp;/gi, '&').replace(/\\u0026/gi, '&')
+        .replace(/\\u003d/gi, '=').replace(/\\\//g, '/');
+      const re = /(?:https?:\/\/[^\s'"<>`]+)?\/?(?:active_wave|gates|gate|gate_map|gate_hub)\.php(?:\?[^\s'"<>`)]*)?/gi;
+      for (const match of decoded.match(re) || []) {
+        out.push({ href: match.replace(/[;,]+$/, ''), label, className: cls, origin });
+      }
     };
-    for (const a of doc.querySelectorAll('a[href]')) {
-      pushCandidate(a.getAttribute('href') || '', textOf(a), String(a.className || ''), 'href');
-    }
-    for (const el of doc.querySelectorAll('[data-href],[data-url],[data-link],[formaction],[action],[onclick]')) {
-      for (const attr of ['data-href', 'data-url', 'data-link', 'formaction', 'action', 'onclick']) {
-        const value = el.getAttribute?.(attr) || '';
-        if (!value) continue;
-        const matches = String(value).match(/(?:https?:\/\/[^\s'"<>]+)?\/?active_wave\.php\?[^\s'"<>)]*/ig) || [];
-        for (const href of matches) pushCandidate(href, textOf(el), String(el.className || ''), attr);
+    for (const el of doc.querySelectorAll('a[href], [data-href], [data-url], [data-link], [formaction], [onclick], form[action]')) {
+      for (const attr of ['href', 'data-href', 'data-url', 'data-link', 'formaction', 'onclick', 'action']) {
+        add(el.getAttribute?.(attr), textOf(el), String(el.className || ''), attr);
       }
     }
-    const html = doc.documentElement?.innerHTML || '';
-    const embedded = html.match(/(?:https?:\/\/[^\s'"<>]+)?\/?active_wave\.php\?(?:amp;)?gate=\d+(?:&|&amp;)wave=\d+[^\s'"<>)]*/ig) || [];
-    for (const href of embedded) pushCandidate(href.replace(/&amp;/gi, '&'), '', '', 'embedded-html');
-    for (const candidate of candidates) {
+    for (const script of doc.querySelectorAll('script:not([src])')) {
+      add(script.textContent || '', '', '', 'inline-script');
+    }
+    add(doc.documentElement?.innerHTML || '', '', '', 'embedded-html');
+    return out;
+  }
+  function collectGateWaveLinks(doc, sourceUrl = location.href, expectedGateId = null) {
+    const out = [];
+    for (const chip of doc.querySelectorAll('.waves-nav a.wave-chip[href]')) {
+      const raw = chip.getAttribute('href') || '';
+      let absolute;
+      try { absolute = new URL(raw, sourceUrl).href; } catch (_) { continue; }
+      const gateId = intParam(absolute, 'gate');
+      const waveId = intParam(absolute, 'wave');
+      if (!gateId || !waveId || !sameOrigin(absolute)) continue;
+      if (expectedGateId != null && Number(gateId) !== Number(expectedGateId)) continue;
+      out.push({ gateId, waveId, label: textOf(chip), className: 'wave-chip',
+        discoveryOrigin: 'wave-navigation', url: absolute, discoveredFrom: sourceUrl });
+    }
+    for (const candidate of gateNavigationCandidates(doc)) {
+      if (!/active_wave\.php/i.test(candidate.href)) continue;
       const href = candidate.href.replace(/&amp;/gi, '&');
       const gateId = intParam(href, 'gate');
       const waveId = intParam(href, 'wave');
-      if (!gateId || !waveId) continue; // event waves are intentionally excluded.
+      if (!gateId || !waveId) continue; // Event waves intentionally excluded.
       if (expectedGateId != null && Number(gateId) !== Number(expectedGateId)) continue;
       const url = safeUrl(href);
       if (!url || !sameOrigin(url)) continue;
       out.push({
-        gateId,
-        waveId,
-        label: candidate.label,
-        className: candidate.className,
-        discoveryOrigin: candidate.origin,
-        url,
-        discoveredFrom: sourceUrl
+        gateId, waveId, label: candidate.label, className: candidate.className,
+        discoveryOrigin: candidate.origin, url, discoveredFrom: sourceUrl
       });
     }
     return uniqueBy(out, x => `${x.gateId}:${x.waveId}`);
   }
   function collectSafeHubLinks(doc, pageUrl) {
     const out = [];
-    for (const a of doc.querySelectorAll('a[href]')) {
-      const href = a.getAttribute('href') || '';
-      const cls = String(a.className || '');
-      const label = textOf(a);
-      const navigationClass = /wave-chip|domain-marker|map-back-btn|gate-card/i.test(cls);
-      const navigationText = /invade|domain|gate\s*(?:map|hub)|back\s+to/i.test(label);
-      if (!navigationClass && !navigationText) continue;
+    for (const candidate of gateNavigationCandidates(doc)) {
+      const href = candidate.href;
+      if (!/\/(?:gates|gate|gate_map|gate_hub)\.php(?:[?#]|$)/i.test('/' + href.replace(/^https?:\/\/[^/]+\//, '').replace(/^\//, ''))) continue;
       const url = safeUrl(href);
       if (!url || !sameOrigin(url)) continue;
       const u = new URL(url);
-      if (!/\.php$/i.test(u.pathname)) continue;
-      if (/active_wave\.php$/i.test(u.pathname)) continue;
-      if (/battle\.php$/i.test(u.pathname)) continue;
-      if (/damage|join|loot|heal|use_item|apply/i.test(u.pathname)) continue;
-      out.push({ url, label, discoveredFrom: pageUrl });
+      if (!/\/(?:gates|gate|gate_map|gate_hub)\.php$/i.test(u.pathname)) continue;
+      out.push({ url, label: candidate.label, discoveredFrom: pageUrl });
     }
     return uniqueBy(out, x => x.url).slice(0, CONFIG.maxHubPages);
   }
@@ -1062,13 +1234,45 @@ async function aurelixGetUpdateStatus(force = false) {
       for (const hub of collectSafeHubLinks(doc, url)) addHub(hub);
     }
 
+    if ([...waveMap.values()].some(w => Number(w.gateId) === 5)) {
+      for (const waveId of [10, 11, 12, 13, 14, 15, 16, 17]) {
+        addWave({
+          gateId: 5, waveId,
+          url: safeUrl(`/active_wave.php?gate=5&wave=${waveId}`),
+          label: `Olympus Wave ${waveId - 8}`,
+          discoveryOrigin: 'verified-olympus-recovery'
+        });
+      }
+    }
+
     const scanWave = async nextWave => {
       const key = `${nextWave.gateId}:${nextWave.waveId}`;
       processedWaves.add(key);
       try {
-        const page = await getPage(gateAliveRequestUrl(nextWave.url), `gate-wave:${key}`, {
-          populationView: 'alive-monsters'
-        });
+        let page;
+        for (let attempt = 0; attempt <= CONFIG.scannerTimeoutRetryCount; attempt++) {
+          try {
+            page = await getPage(gateAliveRequestUrl(nextWave.url), `gate-wave:${key}`, {
+              populationView: 'alive-monsters'
+            });
+            break;
+          } catch (error) {
+            const timedOut = /abort|timeout|timed out/i.test(String(error?.name || '') + ' ' + String(error?.message || ''));
+            if (!timedOut || attempt >= CONFIG.scannerTimeoutRetryCount || state.scanController?.signal.aborted) throw error;
+            AURELIX_TRACE.record('scanner-timeout-retry', {key, attempt:attempt + 1});
+            await sleep(350);
+          }
+        }
+        if (nextWave.discoveryOrigin === 'verified-olympus-recovery') {
+          const observedGate = gateNameFromPage(page.doc);
+          const pageText = normalizeSpace(page.doc.querySelector('.wave-title')?.textContent || '');
+          const hasExpectedGate = /\bolympus\b/i.test(String(observedGate || '') + ' ' + String(page.doc.title || '') + ' ' + pageText);
+          const pageLinks = collectGateWaveLinks(page.doc, nextWave.url);
+          const contradictsGate = pageLinks.some(w => Number(w.gateId) !== 5 && Number(w.waveId) === Number(nextWave.waveId));
+          if (!hasExpectedGate || contradictsGate) {
+            throw new Error(`Olympus recovery rejected unverified wave ${nextWave.waveId}`);
+          }
+        }
         fetchedWaveDocs.set(key, page);
         nextWave.gateName = gateNameFromPage(page.doc);
         nextWave.waveDisplay = gateWaveDisplayFromPage(page.doc) || nextWave.label || `Wave ${nextWave.waveId}`;
@@ -1083,11 +1287,8 @@ async function aurelixGetUpdateStatus(force = false) {
       const remainingWaveSlots = Math.max(0, CONFIG.maxGatePages - processedWaves.size);
       const waveBatch = [...waveMap.values()]
         .filter(w => !processedWaves.has(`${w.gateId}:${w.waveId}`))
-        .slice(0, Math.min(6, remainingWaveSlots));
+        .slice(0, Math.min(CONFIG.scannerWaveConcurrency, remainingWaveSlots));
       if (waveBatch.length) {
-        // Bounded parallelism: live timing diagnostics showed sequential Gate-wave GETs
-        // dominate scan duration. Three concurrent reads materially reduce wall-clock time
-        // without turning the scanner into an unbounded request burst.
         await withCookieOverrides({
           [CONFIG.gateAliveCookie]: CONFIG.gateAliveCookieValue,
           [CONFIG.gateDeadBossCookie]: CONFIG.gateDeadBossCookieValue
@@ -1209,7 +1410,7 @@ async function aurelixGetUpdateStatus(force = false) {
     const out = [];
     timerCards.forEach((timerCard, index) => {
       const text = String(timerCard.textContent || '');
-      const name = firstMeaningfulLine(text);
+      const name = normalizeSpace(timerCard.querySelector('.auto-summon-name')?.textContent || firstMeaningfulLine(text));
       if (!name) return;
       const battleLink = timerCard.querySelector('a[href*="battle.php?id="]');
       const hintedRuntimeId = battleLink ? intParam(battleLink.getAttribute('href') || '', 'id') : null;
@@ -1722,8 +1923,6 @@ async function aurelixGetUpdateStatus(force = false) {
   async function fetchNavigationFallbacks(rootPage) {
     const pages = [];
     const already = new Set([safeUrl(rootPage?.finalUrl || rootPage?.url)]);
-    const rootHasGateLinks = collectGateWaveLinks(rootPage.doc, rootPage.finalUrl).length > 0;
-    if (rootHasGateLinks) return pages;
     for (const path of CONFIG.navigationFallbackPaths || []) {
       const url = safeUrl(path);
       if (!url || already.has(url)) continue;
@@ -1731,7 +1930,6 @@ async function aurelixGetUpdateStatus(force = false) {
       try {
         const page = await getPage(url, `bootstrap-fallback:${path}`);
         pages.push(page);
-        if (collectGateWaveLinks(page.doc, page.finalUrl).length > 0) break;
       } catch (e) {
         state.errors.push({ at: nowIso(), stage: 'bootstrap-fallback', url, message: String(e?.message || e) });
       }
@@ -1788,12 +1986,21 @@ async function aurelixGetUpdateStatus(force = false) {
       ]);
       const resourceResult = await scanResources(rootPage, gateResult);
       const entities = [...dungeonResult.entities, ...gateResult.entities];
+      const verifiedAt = nowIso();
+      for (const entity of entities) {
+        entity.verifiedAt = verifiedAt;
+        entity.freshness = 'live';
+        entity.confidence = entity.status === 'alive' || entity.status === 'dead' ? 1 : 0.65;
+        entity.revision = state.scanSeq;
+      }
       const report = {
         engine: 'AURELIX Core',
         version: VERSION,
         scanSeq: state.scanSeq,
         generatedAt: nowIso(),
         durationMs: Date.now() - startedMs,
+        scanMode: 'full',
+        freshness: { verifiedAt, revision: state.scanSeq, state:'live' },
         bootstrap: {
           dungeons: bootstrapDiagnostics(rootPage, []),
           gates: bootstrapDiagnostics(gatesRootPage, fallbackPages)
@@ -1879,11 +2086,136 @@ async function aurelixGetUpdateStatus(force = false) {
       emitScannerEvent('scan-end', { scanSeq: state.scanSeq });
     }
   }
-  function scanNow() {
+
+  async function performDeltaScan() {
+    if (!state.lastReport) return performScan();
+    state.running = true;
+    emitScannerEvent('scan-start', { scanSeq: state.scanSeq + 1, mode:'delta' });
+    state.scanSeq += 1;
+    state.lastScanStartedAt = nowIso();
+    state.errors = [];
+    const startedMs = Date.now();
+    const previous = state.lastReport;
+    try {
+      const refreshedEntities = [], refreshedLocations = [], refreshedWaves = [], waveFamilies = [];
+      const activeLocations = (previous.dungeonLocations || []).filter(x => x.status === 'available' && x.url);
+      const locationBatches = await mapWithConcurrency(activeLocations, CONFIG.maxDungeonLocationConcurrency, async location => {
+        try {
+          const page = await getPage(location.url, `delta-location:${location.instanceId}:${location.locationId}`, { ttlMs:0 });
+          const detail = parseDungeonLocation(page.doc, {
+            instanceId:location.instanceId, dungeonName:location.dungeonName,
+            locationId:location.locationId, locationName:location.name
+          });
+          refreshedLocations.push({ ...location, serverLeft:detail.left, serverTotal:detail.total });
+          return detail.monsters.map(e => ({ ...e, implementation:location.implementation }));
+        } catch (error) {
+          state.errors.push({ at:nowIso(), stage:'delta-dungeon-location', url:location.url, message:String(error?.message || error) });
+          return [];
+        }
+      });
+      locationBatches.forEach(batch => refreshedEntities.push(...batch));
+
+      const waveLinks = (previous.gateTopology?.waves || []).filter(x => x.url);
+      const waveResults = await mapWithConcurrency(waveLinks, CONFIG.maxDungeonLocationConcurrency, async link => {
+        try {
+          const page = await getPage(gateAliveRequestUrl(link.url), `delta-gate-wave:${link.gateId}:${link.waveId}`, { ttlMs:0 });
+          return parseGateWave(page.doc, link);
+        } catch (error) {
+          state.errors.push({ at:nowIso(), stage:'delta-gate-wave', url:link.url, message:String(error?.message || error) });
+          return null;
+        }
+      });
+      for (const wave of waveResults.filter(Boolean)) {
+        refreshedWaves.push(wave);
+        refreshedEntities.push(...wave.entities);
+        waveFamilies.push(...wave.timerBosses);
+      }
+
+      const verifiedAt = nowIso();
+      refreshedEntities.forEach(entity => {
+        entity.verifiedAt=verifiedAt; entity.freshness='live';
+        entity.confidence=entity.status === 'alive' || entity.status === 'dead' ? 1 : .65;
+        entity.revision=state.scanSeq;
+      });
+      const refreshedDungeonKeys = new Set(activeLocations.map(x => makeId('dungeon-encounter',[x.instanceId,x.locationId])));
+      const refreshedGateKeys = new Set(waveLinks.map(x => `${Number(x.gateId)}:${Number(x.waveId)}`));
+      const preservedEntities = (previous.entities || []).filter(entity => {
+        if (entity.source === 'dungeon') return !refreshedDungeonKeys.has(entity.encounterKey);
+        if (entity.source === 'gate') return !refreshedGateKeys.has(`${Number(entity.gateId)}:${Number(entity.waveId)}`);
+        return true;
+      });
+      const report = {
+        ...previous, version:VERSION, scanSeq:state.scanSeq, generatedAt:verifiedAt,
+        durationMs:Date.now()-startedMs, scanMode:'delta',
+        freshness:{ verifiedAt, revision:state.scanSeq, state:'delta-live' },
+        dungeonLocations:(previous.dungeonLocations || []).map(old =>
+          refreshedLocations.find(x => Number(x.instanceId)===Number(old.instanceId) && Number(x.locationId)===Number(old.locationId)) || old),
+        gateWaves:(previous.gateWaves || []).map(old => {
+          const fresh = refreshedWaves.find(x => Number(x.gateId)===Number(old.gateId) && Number(x.waveId)===Number(old.waveId));
+          return fresh ? {
+            gateId:fresh.gateId, gateName:fresh.gateName, waveId:fresh.waveId, waveDisplay:fresh.waveDisplay,
+            url:fresh.url, entityCount:fresh.entities.length, timerBossCount:fresh.timerBosses.length,
+            generalCount:fresh.generalEntityIds.length, population:fresh.population
+          } : old;
+        }),
+        gateBossFamilies:waveFamilies.length ? waveFamilies : previous.gateBossFamilies,
+        entities:[...preservedEntities,...refreshedEntities],
+        requests:state.requestLog.slice(-24), errors:[...state.errors]
+      };
+      reconcileGatePhaseContinuations(report, previous);
+      annotatePhaseTransitions(report, previous);
+      report.targets=buildTargetRegistry(report);
+      state.lastReport=report; state.lastScanFinishedAt=verifiedAt;
+      emitScannerEvent('scan-complete',{scanSeq:report.scanSeq,mode:'delta',report});
+      return report;
+    } finally {
+      state.running=false;
+      emitScannerEvent('scan-end',{scanSeq:state.scanSeq,mode:'delta'});
+    }
+  }
+
+  async function microRefresh(entityOrId) {
+    const previous=state.lastReport;
+    if (!previous) return scanNow();
+    const entity=typeof entityOrId === 'object' ? entityOrId :
+      (previous.entities || []).find(x => String(x.entityId)===String(entityOrId) || String(x.runtimeId)===String(entityOrId));
+    if (!entity) return previous;
+    const startedMs=Date.now();
+    let freshEntities=[];
+    if (entity.source === 'dungeon') {
+      const location=(previous.dungeonLocations || []).find(x => Number(x.instanceId)===Number(entity.instanceId) && Number(x.locationId)===Number(entity.locationId));
+      if (!location?.url) return previous;
+      const page=await getPage(location.url,`micro-dungeon:${location.instanceId}:${location.locationId}`,{ttlMs:0});
+      const detail=parseDungeonLocation(page.doc,{instanceId:location.instanceId,dungeonName:location.dungeonName,locationId:location.locationId,locationName:location.name});
+      freshEntities=detail.monsters.map(e => ({...e,implementation:location.implementation}));
+    } else if (entity.source === 'gate') {
+      const link=(previous.gateTopology?.waves || []).find(x => Number(x.gateId)===Number(entity.gateId) && Number(x.waveId)===Number(entity.waveId));
+      if (!link?.url) return previous;
+      const page=await getPage(gateAliveRequestUrl(link.url),`micro-gate:${link.gateId}:${link.waveId}`,{ttlMs:0});
+      freshEntities=parseGateWave(page.doc,link).entities;
+    } else return previous;
+
+    state.scanSeq += 1;
+    const verifiedAt=nowIso();
+    freshEntities.forEach(x => { x.verifiedAt=verifiedAt; x.freshness='live'; x.confidence=1; x.revision=state.scanSeq; });
+    const keep=(previous.entities || []).filter(x => entity.source === 'dungeon'
+      ? x.encounterKey !== entity.encounterKey
+      : !(x.source === 'gate' && Number(x.gateId)===Number(entity.gateId) && Number(x.waveId)===Number(entity.waveId)));
+    const report={...previous,version:VERSION,scanSeq:state.scanSeq,generatedAt:verifiedAt,durationMs:Date.now()-startedMs,
+      scanMode:'micro',freshness:{verifiedAt,revision:state.scanSeq,state:'micro-live'},entities:[...keep,...freshEntities]};
+    report.targets=buildTargetRegistry(report);
+    state.lastReport=report; state.lastScanFinishedAt=verifiedAt;
+    emitScannerEvent('entity-updated',{scanSeq:report.scanSeq,mode:'micro',entityId:entity.entityId,report});
+    emitScannerEvent('scan-complete',{scanSeq:report.scanSeq,mode:'micro',report});
+    return report;
+  }
+
+  function scanNow(options = {}) {
     if (state.inFlight) return state.inFlight;
     const scanController = new AbortController();
     state.scanController = scanController;
-    const task = performScan();
+    const mode = typeof options === 'string' ? options : String(options?.mode || 'full').toLowerCase();
+    const task = mode === 'delta' ? performDeltaScan() : performScan();
     state.inFlight = task;
     return task.finally(() => {
       if (state.inFlight === task) state.inFlight = null;
@@ -1959,6 +2291,9 @@ async function aurelixGetUpdateStatus(force = false) {
       scanSeq: state.scanSeq,
       lastScanStartedAt: state.lastScanStartedAt,
       lastScanFinishedAt: state.lastScanFinishedAt,
+      cache: { entries:state.pageCache.size, hits:state.cacheHits },
+      architecture: { full:true, delta:true, micro:true, scheduledMode:'full' },
+      lastMode: state.lastReport?.scanMode || null,
       lastSummary: state.lastReport ? {
         dungeons: state.lastReport.dungeons.length,
         dungeonLocations: state.lastReport.dungeonLocations.length,
@@ -1974,6 +2309,8 @@ async function aurelixGetUpdateStatus(force = false) {
     version: VERSION,
     config: CONFIG,
     scanNow,
+    scanDelta: () => scanNow({ mode:'delta' }),
+    microRefresh,
     start,
     stop,
     subscribe,
@@ -1991,12 +2328,12 @@ async function aurelixGetUpdateStatus(force = false) {
     copyReport
   });
   console.log('[AURELIX] Core v' + VERSION + ' loaded.');
-  console.log('[AURELIX] API: AURELIX.scanNow(), .status(), .getDungeons(), .getDungeonLocations(), .getCubeState(), .getGateWaves(), .getReport(), .copyReport(), .start(), .stop()');
+  console.log('[AURELIX] API: AURELIX.scanNow(), .scanDelta(), .microRefresh(entity), .status(), .getDungeons(), .getDungeonLocations(), .getCubeState(), .getGateWaves(), .getReport(), .copyReport(), .start(), .stop()');
   if (CONFIG.autoStart) start();
 })();
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.5.74';
+  const ENGINE_VERSION = '0.6.4';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -2009,7 +2346,8 @@ async function aurelixGetUpdateStatus(force = false) {
     equipmentPresets: 'aurelix_equipment_presets_v0544',
     petPresets: 'aurelix_pet_presets_v0544',
     loadoutAssignments: 'aurelix_target_loadout_assignments_v0544',
-    legacyPresetImport: 'aurelix_legacy_preset_import_v0573'
+    legacyPresetImport: 'aurelix_legacy_preset_import_v0573',
+    checkpoint: 'aurelix_engine_config_checkpoint_v064'
   });
   const PHASE_RUNTIME_STORE = 'aurelix_engine_phase_runtime_v0542';
   const ENGINE_STATES = Object.freeze({
@@ -2024,9 +2362,10 @@ async function aurelixGetUpdateStatus(force = false) {
     mode: 'full',
     autoLoot: true,
     expThreshold: 20,
-    attackCooldownMs: 140,
+    attackCooldownMs: 130,
     phasePollMs: 1500,
-    softOvershootPct: 0.04
+    softOvershootPct: 0.04,
+    performanceMode: 'balanced'
   });
   const DUNGEON_LOOT_SWEEP_MIN_MS = 5000;
   const LOOT_REJECT_COOLDOWN_MS = 120000;
@@ -2091,6 +2430,25 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   function savePhaseRuntime(value) {
     try { sessionStorage.setItem(PHASE_RUNTIME_STORE, JSON.stringify(value || {})); return true; } catch (_) { return false; }
+  }
+  const configCheckpointAtBoot = loadObject(ENGINE_STORE.checkpoint, null);
+  if (configCheckpointAtBoot && typeof configCheckpointAtBoot === 'object') {
+    const sections = {
+      settings: ENGINE_STORE.settings,
+      targets: ENGINE_STORE.targets,
+      catalog: ENGINE_STORE.catalog,
+      potions: ENGINE_STORE.potions,
+      skills: ENGINE_STORE.skills,
+      skillTargets: ENGINE_STORE.skillTargets,
+      equipmentPresets: ENGINE_STORE.equipmentPresets,
+      petPresets: ENGINE_STORE.petPresets,
+      loadoutAssignments: ENGINE_STORE.loadoutAssignments
+    };
+    for (const [section, key] of Object.entries(sections)) {
+      if (configCheckpointAtBoot[section] !== undefined) {
+        saveObject(key, configCheckpointAtBoot[section]);
+      }
+    }
   }
   const manualSnapshotAtBoot = loadObject(ENGINE_STORE.manualSnapshot, {});
   function mergedPersistedSection(snapshotKey, storeKey) {
@@ -2176,8 +2534,6 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!existing) return { ...candidate };
     const candidateAt = Number(candidate.updatedAt) || 0;
     const existingAt = Number(existing.updatedAt) || 0;
-    // A policy attached to the key currently being canonicalized wins an
-    // exact tie. This protects legacy policies that predate updatedAt.
     return { ...(candidateAt >= existingAt ? candidate : existing) };
   }
   function mergeCatalogItem(key, item) {
@@ -2389,53 +2745,134 @@ async function aurelixGetUpdateStatus(force = false) {
     return Object.values(state.targetCatalog);
   }
   class AdaptiveSlashModel {
-    constructor() {
-      this.damagePerStamina = null;
-      this.samples = 0;
-    }
+    constructor() { this.reset(); }
     reset() {
       this.damagePerStamina = null;
       this.samples = 0;
+      this.mean = 0;
+      this.m2 = 0;
+      this.min = null;
+      this.max = null;
+      this.critSamples = 0;
     }
     observe({ damage, stamina, critical = false }) {
-      let dealt = Number(damage);
-      const cost = Number(stamina);
-      if (!Number.isFinite(dealt) || dealt <= 0 || !Number.isFinite(cost) || cost <= 0) return;
+      const dealt = Number(damage), cost = Number(stamina);
+      if (!(dealt > 0) || !(cost > 0)) return;
       const sample = dealt / cost;
       if (!Number.isFinite(sample) || sample <= 0) return;
-      if (this.damagePerStamina == null) this.damagePerStamina = sample;
-      else this.damagePerStamina = Math.max(this.damagePerStamina, sample);
       this.samples += 1;
+      const delta = sample - this.mean;
+      this.mean += delta / this.samples;
+      this.m2 += delta * (sample - this.mean);
+      this.min = this.min == null ? sample : Math.min(this.min, sample);
+      this.max = this.max == null ? sample : Math.max(this.max, sample);
+      if (critical) this.critSamples += 1;
+      this.damagePerStamina = this.upperBound();
+    }
+    variance() { return this.samples > 1 ? this.m2 / (this.samples - 1) : 0; }
+    upperBound() {
+      if (!this.samples) return null;
+      const sigma = Math.sqrt(Math.max(0, this.variance()));
+      const statistical = this.mean + (this.samples >= 3 ? 1.35 * sigma : 0);
+      return Math.max(this.max || 0, statistical || 0, this.mean || 0);
+    }
+    confidence() {
+      if (!this.samples) return 0;
+      const spread = this.mean > 0 ? Math.sqrt(this.variance()) / this.mean : 1;
+      return Math.max(0.15, Math.min(0.99, (1 - Math.min(0.75, spread)) * Math.min(1, this.samples / 6)));
     }
     choose({ remainingDamage, damageLimit, staminaAvailable, softOvershootPct = 0.04 }) {
       const remaining = Number(remainingDamage);
       const limit = Math.max(0, Number(damageLimit) || 0);
       const stamina = Number(staminaAvailable);
       if (!(remaining > 0) || !(stamina > 0)) return null;
-      if (!(this.damagePerStamina > 0) || this.samples < 1) {
+      const perStamina = this.upperBound();
+      if (!(perStamina > 0) || this.samples < 1) {
         return stamina >= 1
-          ? { ...SLASH_TIERS[SLASH_TIERS.length - 1], estimatedDamage: null, calibration: true }
+          ? { ...SLASH_TIERS[SLASH_TIERS.length - 1], estimatedDamage: null, calibration: true, confidence:0 }
           : null;
       }
       const tolerance = Math.max(0, limit * Math.max(0, Number(softOvershootPct) || 0));
       const budget = remaining + tolerance;
       for (const tier of SLASH_TIERS) {
         if (tier.stamina > stamina) continue;
-        const estimate = this.damagePerStamina * tier.stamina;
-        if (estimate <= budget) return { ...tier, estimatedDamage: estimate };
+        const estimate = perStamina * tier.stamina;
+        if (estimate <= budget) return { ...tier, estimatedDamage: estimate, confidence:this.confidence() };
       }
       const smallest = SLASH_TIERS[SLASH_TIERS.length - 1];
       return smallest.stamina <= stamina
-        ? { ...smallest, estimatedDamage: this.damagePerStamina * smallest.stamina }
+        ? { ...smallest, estimatedDamage: perStamina * smallest.stamina, confidence:this.confidence() }
         : null;
     }
     snapshot() {
       return {
         samples: this.samples,
-        damagePerStamina: this.damagePerStamina
+        damagePerStamina: this.damagePerStamina,
+        meanDamagePerStamina: this.mean || null,
+        minDamagePerStamina: this.min,
+        maxDamagePerStamina: this.max,
+        variance: this.variance(),
+        confidence: this.confidence(),
+        criticalSamples: this.critSamples
       };
     }
   }
+
+  class AurelixActionScheduler {
+    constructor() {
+      this.activeMutations = 0;
+      this.activeReads = 0;
+      this.queue = [];
+      this.inFlightReads = new Map();
+      this.seq = 0;
+    }
+    limits() {
+      const mode = state?.settings?.performanceMode || 'balanced';
+      return mode === 'eco' ? { reads:2 } : mode === 'turbo' ? { reads:5 } : { reads:3 };
+    }
+    schedule(task, { priority=5, mutation=false, dedupeKey=null } = {}) {
+      if (!mutation && dedupeKey && this.inFlightReads.has(dedupeKey)) {
+        state.performance.dedupHits += 1;
+        return this.inFlightReads.get(dedupeKey);
+      }
+      const promise = new Promise((resolve, reject) => {
+        const job = { task, priority, mutation, dedupeKey, resolve, reject, seq:++this.seq };
+        let lo = 0, hi = this.queue.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          if (this.queue[mid].priority <= priority) lo = mid + 1;
+          else hi = mid;
+        }
+        this.queue.splice(lo, 0, job);
+        this.pump();
+      });
+      if (!mutation && dedupeKey) {
+        this.inFlightReads.set(dedupeKey, promise);
+        promise.then(
+          () => { if (this.inFlightReads.get(dedupeKey) === promise) this.inFlightReads.delete(dedupeKey); },
+          () => { if (this.inFlightReads.get(dedupeKey) === promise) this.inFlightReads.delete(dedupeKey); }
+        );
+      }
+      return promise;
+    }
+    pump() {
+      const readLimit = this.limits().reads;
+      for (;;) {
+        const index = this.queue.findIndex(job => job.mutation ? this.activeMutations === 0 : this.activeReads < readLimit);
+        if (index < 0) break;
+        const job = this.queue.splice(index,1)[0];
+        if (job.mutation) this.activeMutations += 1; else this.activeReads += 1;
+        Promise.resolve().then(job.task).then(job.resolve, job.reject).finally(() => {
+          if (job.mutation) this.activeMutations -= 1; else this.activeReads -= 1;
+          this.pump();
+        });
+      }
+    }
+    snapshot() {
+      return { queued:this.queue.length, activeReads:this.activeReads, activeMutations:this.activeMutations, dedupedReads:this.inFlightReads.size };
+    }
+  }
+  const actionScheduler = new AurelixActionScheduler();
   const state = {
     status: ENGINE_STATES.OFF,
     settings: {
@@ -2504,6 +2941,7 @@ async function aurelixGetUpdateStatus(force = false) {
     phaseProgress: loadPhaseRuntime(),
     phaseWaitLogAt: {},
     phaseWaitPolls: {},
+    phaseDeferredUntil: {},
     liveResources: {},
     listeners: new Set(),
     log: [],
@@ -2518,7 +2956,12 @@ async function aurelixGetUpdateStatus(force = false) {
     markTotalByEncounter: {},
     observedPotionRestore: {},
     lastCatalogReportToken: null,
-    combatPreflight: { key: null, snapshot: null, fetchedAt: 0, actionsSinceFresh: 0 }
+    combatPreflight: { key: null, snapshot: null, fetchedAt: 0, actionsSinceFresh: 0 },
+    performance: {
+      requests:0, requestMs:0, requestFailures:0, retries:0, dedupHits:0,
+      decisions:0, decisionMs:0, combatCycles:0, combatMs:0,
+      endpointHealth:{}, startedAt:Date.now()
+    }
   };
   let unsubscribeScanner = null;
   if (window.AURELIX?.subscribe) {
@@ -2551,6 +2994,7 @@ async function aurelixGetUpdateStatus(force = false) {
       resources: { ...(window.AURELIX?.getReport?.()?.resources?.player || {}), ...state.liveResources },
       currentTarget: state.currentTarget,
       currentPlan: state.currentPlan,
+      livePipeline: livePipeline,
       lastDecisionAt: state.lastDecisionAt,
       lastScannerSeq: state.lastScannerSeq,
       lastReportGeneratedAt: state.lastReportGeneratedAt,
@@ -2596,13 +3040,16 @@ async function aurelixGetUpdateStatus(force = false) {
       expThreshold: Math.round(boundedNumber(next?.expThreshold, DEFAULT_SETTINGS.expThreshold, 1, 99)),
       attackCooldownMs: Math.round(boundedNumber(next?.attackCooldownMs, DEFAULT_SETTINGS.attackCooldownMs, 120, 5000)),
       phasePollMs: Math.round(boundedNumber(next?.phasePollMs, DEFAULT_SETTINGS.phasePollMs, 1500, 10_000)),
-      softOvershootPct: boundedNumber(next?.softOvershootPct, DEFAULT_SETTINGS.softOvershootPct, 0, 0.10)
+      softOvershootPct: boundedNumber(next?.softOvershootPct, DEFAULT_SETTINGS.softOvershootPct, 0, 0.10),
+      performanceMode: ['eco','balanced','turbo'].includes(String(next?.performanceMode || '').toLowerCase())
+        ? String(next.performanceMode).toLowerCase()
+        : DEFAULT_SETTINGS.performanceMode
     };
   }
   state.settings = normalizeSettings(state.settings);
   {
     let speedMigrated = false;
-    if ([700, 550, 350, 250].includes(state.settings.attackCooldownMs)) { state.settings.attackCooldownMs = 140; speedMigrated = true; }
+    if ([700, 550, 350, 250, 140].includes(state.settings.attackCooldownMs)) { state.settings.attackCooldownMs = 130; speedMigrated = true; }
     if (state.settings.phasePollMs === 2500) { state.settings.phasePollMs = 1500; speedMigrated = true; }
     if (speedMigrated) saveObject(ENGINE_STORE.settings, state.settings);
   }
@@ -2835,9 +3282,6 @@ async function aurelixGetUpdateStatus(force = false) {
       candidates.push({ key, policy: normalizePotionPolicy(value) });
     }
     if (!candidates.length) return null;
-    // Legacy aliases were historically written together. If stale conflicting aliases
-    // exist, preserve an explicitly configured policy rather than falling back to the
-    // default disabled/0 state that caused intermittent scanner resets.
     candidates.sort((a, b) =>
       Number(b.policy.enabled) - Number(a.policy.enabled) ||
       Number(b.policy.limit > 0) - Number(a.policy.limit > 0) ||
@@ -3014,6 +3458,12 @@ async function aurelixGetUpdateStatus(force = false) {
     delete state.encounterLedger[runtimeEncounterKey(target)];
     target.currentUserDamage = null;
     target.userDamage = null;
+    target.phaseWaiting = false;
+    target.phaseStage = 'phase3';
+    if (state.currentTarget && sameRuntimeTarget(state.currentTarget, target)) {
+      state.currentTarget.phaseWaiting = false;
+      state.currentTarget.phaseStage = 'phase3';
+    }
     savePhaseRuntime(state.phaseProgress);
     return progress;
   }
@@ -3041,11 +3491,13 @@ async function aurelixGetUpdateStatus(force = false) {
       changed = true;
     }
     target.phaseStage = 'phase3';
+    target.phaseWaiting = false;
     target.phase3Baseline = progress.phase3Baseline;
     target.damageLimit = progress.phase3Baseline + limits.phase3;
     if (state.currentTarget && sameRuntimeTarget(state.currentTarget, target)) {
       Object.assign(state.currentTarget, {
         phaseStage:'phase3',
+        phaseWaiting:false,
         phase3Baseline:progress.phase3Baseline,
         phase3DamageLimit:limits.phase3,
         damageLimit:target.damageLimit
@@ -3115,6 +3567,7 @@ async function aurelixGetUpdateStatus(force = false) {
         : phaseLimits.phase1;
       const phaseWaiting = !inPhase3 && phaseLimits.phase3 > 0 && (!(phaseLimits.phase1 > 0) || (damageKnown && userDamage >= phaseLimits.phase1));
       if (!phaseWaiting && damageKnown && userDamage >= damageLimit) continue;
+      if (phaseWaiting && Number(state.phaseDeferredUntil[phaseProgressKey({ ...entity, logicalKey, policyKey })] || 0) > Date.now()) continue;
       if (inPhase3 && !(phaseLimits.phase3 > 0)) continue;
       const loadoutAssignment = assignmentForTarget(entity, policyKey);
       const requiredLoadoutKey = loadoutGroupKey(loadoutAssignment);
@@ -3144,6 +3597,30 @@ async function aurelixGetUpdateStatus(force = false) {
     });
     return candidates;
   }
+  const PIPELINE_KEYS = ['scan','decide','loadout','resource','attack','verify'];
+  let livePipeline = null;
+  function pipelineStage(key, detail = '') {
+    if (!PIPELINE_KEYS.includes(key) || state.status !== ENGINE_STATES.RUNNING) return;
+    const now = Date.now();
+    if (livePipeline?.key === key && livePipeline?.detail === detail) return;
+    const previous = livePipeline?.pipeline || [];
+    const pipeline = PIPELINE_KEYS.map(name => {
+      const old = previous.find(item => item.key === name);
+      if (name === key) return {
+        key: name, state: 'active',
+        startedAt: old?.state === 'active' ? old.startedAt : now,
+        durationMs: old?.state === 'active' ? old.durationMs : undefined
+      };
+      if (old?.state === 'active') return {
+        key: name, state: 'done', startedAt: old.startedAt,
+        durationMs: Math.max(0, now - (old.startedAt || now))
+      };
+      return old ? { ...old } : { key: name, state: 'pending' };
+    });
+    livePipeline = { key, detail, at: now, pipeline };
+    emit();
+  }
+  function pipelineClear() { livePipeline = null; emit(); }
   function makePlan(entity) {
     if (!entity) return null;
     return {
@@ -3161,10 +3638,20 @@ async function aurelixGetUpdateStatus(force = false) {
       remainingDamage: entity.remainingDamage,
       requiresDamageVerification: entity.requiresDamageVerification,
       nextStage: entity.requiresDamageVerification ? 'verify-damage' : 'join-or-attack',
+      pipeline: [
+        { key:'scan', state:'done' },
+        { key:'decide', state:'done' },
+        { key:'loadout', state: activeLoadoutMatches(entity.loadoutAssignment) ? 'done' : 'pending' },
+        { key:'resource', state:'pending' },
+        { key:'attack', state:'pending' },
+        { key:'verify', state: entity.requiresDamageVerification ? 'active' : 'pending' }
+      ],
+      freshness: entity.discoveredAt || null,
       liveActionsEnabled: true
     };
   }
   function decideNow() {
+    const __decisionStarted = performance.now();
     if (state.status !== ENGINE_STATES.RUNNING) return null;
     if (state.loadoutInFlight) return clone(state.currentPlan);
     const scanner = window.AURELIX;
@@ -3185,9 +3672,13 @@ async function aurelixGetUpdateStatus(force = false) {
     state.lastReportGeneratedAt = report.generatedAt ?? null;
     updateTargetCatalog(report);
     const candidates = buildCandidates(report);
-    const selected = candidates[0] || null;
+    const selected = candidates.find(c => !c.phaseWaiting) || candidates.find(c => c.phaseWaiting) || null;
     const previousEntityId = state.currentTarget?.entityId || null;
     state.currentTarget = selected ? clone(selected) : null;
+    if (!selected && state.status === ENGINE_STATES.RUNNING && Date.now() - Number(state.lastIdleTargetLogAt || 0) >= 30_000) {
+      state.lastIdleTargetLogAt = Date.now();
+      pushLog('phase', 'Waiting for active target. Other queued monsters will be processed as soon as they become eligible.');
+    }
     state.currentPlan = selected ? makePlan(selected) : {
       type: 'idle',
       createdAt: state.lastDecisionAt,
@@ -3195,7 +3686,7 @@ async function aurelixGetUpdateStatus(force = false) {
       liveActionsEnabled: true
     };
     if (selected?.entityId && selected.entityId !== previousEntityId) {
-      pushLog('target', `Target selected: ${selected.name}.`, {
+      if (!selected.phaseWaiting) pushLog('target', `Target selected: ${selected.name}.`, {
         source: selected.source,
         logicalKey: selected.logicalKey,
         runtimeId: selected.runtimeId,
@@ -3204,6 +3695,8 @@ async function aurelixGetUpdateStatus(force = false) {
     } else {
       emit();
     }
+    state.performance.decisions += 1;
+    state.performance.decisionMs += Math.max(0, performance.now() - __decisionStarted);
     return clone(state.currentPlan);
   }
   async function reconcileScanner() {
@@ -3297,9 +3790,24 @@ async function aurelixGetUpdateStatus(force = false) {
     const n = Number(match[0]);
     return Number.isFinite(n) ? n : null;
   }
-  const TRANSIENT_SERVER_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+  const TRANSIENT_SERVER_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
   function isTransientServerStatus(status) {
     return TRANSIENT_SERVER_STATUSES.has(Number(status));
+  }
+  function axRetryDelay(attempt, response=null) {
+    const raw = response?.headers?.get?.('Retry-After');
+    if (raw) {
+      const seconds = Number(raw);
+      const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(raw) - Date.now();
+      if (Number.isFinite(delay) && delay >= 0) return Math.min(30_000, Math.max(250, delay));
+    }
+    return Math.min(5_000, (350 * 2 ** attempt) + Math.floor(Math.random() * 180));
+  }
+  function axCircuitCooldown(failures) {
+    return Math.min(30_000, 2_000 * 2 ** Math.min(4, Math.max(0, failures - 3)));
+  }
+  function axRecordRecovery(data) {
+    try { AURELIX_TRACE.record('network-recovery', data); } catch (_) {}
   }
   const NETWORK_GET_TIMEOUT_MS = 6_000;
   const NETWORK_POST_TIMEOUT_MS = 8_000;
@@ -3314,42 +3822,81 @@ async function aurelixGetUpdateStatus(force = false) {
       : (method === 'GET' ? NETWORK_GET_TIMEOUT_MS : NETWORK_POST_TIMEOUT_MS);
     const requestedRetries = Number(options.safeRetries);
     const safeRetries = method === 'GET'
-      ? (Number.isFinite(requestedRetries) ? Math.max(0, Math.min(1, requestedRetries)) : 1)
+      ? (Number.isFinite(requestedRetries) ? Math.max(0, Math.min(2, requestedRetries)) : 1)
       : 0;
-    for (let attempt = 0; ; attempt += 1) {
-      const controller = new AbortController();
-      const abortFromExternal = () => controller.abort(externalSignal?.reason);
-      if (externalSignal?.aborted) abortFromExternal();
-      else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
-      const timeout = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
-      try {
-        const {
-          signal: _ignoredSignal,
-          timeoutMs: _ignoredTimeout,
-          safeRetries: _ignoredRetries,
-          ...requestOptions
-        } = options;
-        const res = await fetch(resolvedUrl.href, {
-          credentials: 'include',
-          cache: method === 'GET' ? 'no-store' : 'default',
-          ...requestOptions,
-          signal: controller.signal
-        });
-        const text = await res.text();
-        if (attempt < safeRetries && isTransientServerStatus(res.status)) {
-          await sleep(250, externalSignal);
-          continue;
-        }
-        return { res, text };
-      } catch (error) {
-        if (externalSignal?.aborted) throw error;
-        if (controller.signal.aborted) throw new Error(`Network request timed out after ${Math.round(timeoutMs / 1000)}s`);
-        throw error;
-      } finally {
-        clearTimeout(timeout);
-        externalSignal?.removeEventListener?.('abort', abortFromExternal);
+    const endpointKey = `${method}:${resolvedUrl.pathname}`;
+    const health = state.performance.endpointHealth[endpointKey] ||= { failures:0, openUntil:0, latencyMs:0, status:'healthy' };
+    const priority = method === 'POST' ? 1 : (/battle\.php|inventory|power_crystals|pet/i.test(resolvedUrl.pathname) ? 2 : 5);
+    const dedupeKey = method === 'GET' ? resolvedUrl.href : null;
+    const axQueuedAt = performance.now();
+    return actionScheduler.schedule(async () => {
+      const axQueueMs = performance.now() - axQueuedAt;
+      if (health.openUntil > Date.now()) {
+        axRecordRecovery({method,path:resolvedUrl.pathname,outcome:'circuit-open',waitMs:health.openUntil-Date.now()});
+        throw new Error(`${resolvedUrl.pathname} is temporarily paused by the AURELIX circuit breaker.`);
       }
-    }
+      for (let attempt = 0; ; attempt += 1) {
+        const started = performance.now();
+        const controller = new AbortController();
+        const abortFromExternal = () => controller.abort(externalSignal?.reason);
+        if (externalSignal?.aborted) abortFromExternal();
+        else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
+        const timeout = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
+        let retryResponse = null;
+        let retryReason = '';
+        let lastError = null;
+        try {
+          const { signal:_s, timeoutMs:_t, safeRetries:_r, priority:_p, ...requestOptions } = options;
+          const res = await fetch(resolvedUrl.href, {
+            credentials:'include', cache:method === 'GET' ? 'no-store' : 'default',
+            ...requestOptions, signal:controller.signal
+          });
+          const body = await res.text();
+          const elapsed = Math.max(0, performance.now() - started);
+          state.performance.requests += 1;
+          state.performance.requestMs += elapsed;
+          health.latencyMs = health.latencyMs ? health.latencyMs * .75 + elapsed * .25 : elapsed;
+          AURELIX_TRACE.record('request', {source:'engine',method,path:resolvedUrl.pathname,status:res.status,ms:elapsed,queueMs:axQueueMs,attempt:attempt+1,failed:!res.ok});
+          if (res.ok) {
+            health.failures=0; health.openUntil=0; health.status='healthy';
+            if (attempt) axRecordRecovery({method,path:resolvedUrl.pathname,outcome:'recovered',attempts:attempt+1});
+            return {res,text:body};
+          }
+          if (isTransientServerStatus(res.status)) {
+            health.failures += 1;
+            state.performance.requestFailures += 1;
+            health.status = health.failures >= 3 ? 'open' : 'degraded';
+            if (health.failures >= 3) health.openUntil=Date.now()+axCircuitCooldown(health.failures);
+            if (method === 'GET' && attempt < safeRetries && !externalSignal?.aborted) {
+              retryResponse=res; retryReason=`HTTP ${res.status}`;
+            }
+          }
+          if (!retryReason) return {res,text:body};
+        } catch (error) {
+          lastError = error;
+          const timedOut = controller.signal.aborted && !externalSignal?.aborted;
+          const message = timedOut ? `Network request timed out after ${Math.round(timeoutMs / 1000)}s` : String(error?.message || error);
+          AURELIX_TRACE.record('request', {source:'engine',method,path:resolvedUrl.pathname,ms:performance.now()-started,queueMs:axQueueMs,attempt:attempt+1,failed:true,error:message});
+          state.performance.requestFailures += 1;
+          health.failures += 1;
+          health.status = health.failures >= 3 ? 'open' : 'degraded';
+          if (health.failures >= 3) health.openUntil=Date.now()+axCircuitCooldown(health.failures);
+          if (externalSignal?.aborted) throw error;
+          if (method === 'GET' && attempt < safeRetries) retryReason = timedOut ? 'timeout' : 'network-exception';
+          else {
+            axRecordRecovery({method,path:resolvedUrl.pathname,outcome:'failed',attempts:attempt+1,reason:message});
+            throw timedOut ? new Error(message) : error;
+          }
+        } finally {
+          clearTimeout(timeout);
+          externalSignal?.removeEventListener?.('abort', abortFromExternal);
+        }
+        const delay = axRetryDelay(attempt, retryResponse);
+        state.performance.retries += 1;
+        axRecordRecovery({method,path:resolvedUrl.pathname,outcome:'retry',attempt:attempt+1,reason:retryReason,delayMs:delay});
+        await sleep(delay, externalSignal);
+      }
+    }, {priority,mutation:method !== 'GET',dedupeKey});
   }
   const LOADOUT_LEGACY = Object.freeze({
     equipment: 'veyra_equipment_crystal_quicksets_v1',
@@ -3469,6 +4016,32 @@ async function aurelixGetUpdateStatus(force = false) {
     emit();
     return saved !== false;
   }
+  let axLoadoutTrace = null;
+  function axLoadoutStage(name, data = {}) {
+    if (!axLoadoutTrace) return;
+    const now = performance.now();
+    const previous = axLoadoutTrace.stage;
+    if (previous) AURELIX_TRACE.record('loadout-stage', {
+      operation:axLoadoutTrace.id, stage:previous, ms:now-axLoadoutTrace.stageAt,
+      requests:axLoadoutTrace.requests, requestMs:axLoadoutTrace.requestMs
+    });
+    axLoadoutTrace.stage = name;
+    axLoadoutTrace.stageAt = now;
+    axLoadoutTrace.requests = 0;
+    axLoadoutTrace.requestMs = 0;
+    AURELIX_TRACE.record('loadout-transition', {operation:axLoadoutTrace.id, stage:name, ...data});
+  }
+  async function axLoadoutTimed(label, fn) {
+    const start = performance.now();
+    try {
+      const result = await fn();
+      AURELIX_TRACE.record('loadout-step', {operation:axLoadoutTrace?.id || 0, step:label, ms:performance.now()-start, ok:true});
+      return result;
+    } catch (error) {
+      AURELIX_TRACE.record('loadout-step', {operation:axLoadoutTrace?.id || 0, step:label, ms:performance.now()-start, ok:false, error:error?.message || String(error)});
+      throw error;
+    }
+  }
   async function loadoutRequest(url, { method='GET', params=null, expect='auto' } = {}) {
     let target = url;
     const verb = String(method).toUpperCase();
@@ -3489,6 +4062,7 @@ async function aurelixGetUpdateStatus(force = false) {
       options.body = body.toString();
     }
     let response;
+    const axRequestAt = performance.now();
     try {
       response = await fetchText(target, options);
     } catch (error) {
@@ -3496,6 +4070,9 @@ async function aurelixGetUpdateStatus(force = false) {
       await sleep(500, options.signal);
       response = await fetchText(target, { ...options, safeRetries:1 });
     }
+    const axRequestMs = performance.now() - axRequestAt;
+    if (axLoadoutTrace) { axLoadoutTrace.requests++; axLoadoutTrace.requestMs += axRequestMs; }
+    AURELIX_TRACE.record('loadout-request', {operation:axLoadoutTrace?.id || 0, stage:axLoadoutTrace?.stage || 'manual', method:verb, path:String(url).split('?')[0], ms:axRequestMs, status:response.res.status});
     const { res, text } = response;
     if (!res.ok) throw new Error(`${url} HTTP ${res.status}: ${text.slice(0,160)}`);
     if (expect === 'text') return text;
@@ -3607,6 +4184,9 @@ async function aurelixGetUpdateStatus(force = false) {
       item.crystals = card?.crystals || [];
     }
     Object.defineProperty(equipped, '_crystalCards', { value:cards, enumerable:false });
+    Object.defineProperty(equipped, '_crystalInitialPage', {
+      value:{ doc:docFromHtml(crystalHtml), checkedAt:Date.now() }, enumerable:false
+    });
     return equipped;
   }
   const crystalIds = list => (list || []).map(x => String(x?.id ?? x)).sort().join(',');
@@ -3627,30 +4207,39 @@ async function aurelixGetUpdateStatus(force = false) {
     });
   }
   async function captureEquipmentPreset(name, { persist = true } = {}) {
-    const [attackHtml, pvpHtml, defenseHtml, crystalHtml] = await Promise.all([
+    const [attackHtml, crystalHtml] = await Promise.all([
       loadoutRequest('/inventory.php', { params:{ set:'attack' }, expect:'text' }),
-      loadoutRequest('/inventory.php', { params:{ set:'pvp_attack' }, expect:'text' }).catch(() => ''),
-      loadoutRequest('/inventory.php', { params:{ set:'defense' }, expect:'text' }).catch(() => ''),
       loadoutRequest('/power_crystals.php', { expect:'text' })
     ]);
-    const inventoryDocs = {
-      attack:docFromHtml(attackHtml),
-      pvp_attack:docFromHtml(pvpHtml),
-      defense:docFromHtml(defenseHtml)
-    };
-    const equipped = parseEquippedEquipment(inventoryDocs.attack);
+    const attackDoc = docFromHtml(attackHtml);
+    const equipped = parseEquippedEquipment(attackDoc);
     if (!Object.keys(equipped).length) throw new Error('No PvE equipment detected.');
-    const inventoryRecords = [];
-    for (const doc of Object.values(inventoryDocs)) {
-      inventoryRecords.push(...parseUnequippedEquipment(doc));
-    }
-    const crystalCards = parseCrystalEquipment(docFromHtml(crystalHtml));
-    const crystalByImage = new Map(crystalCards.filter(x => x.image).map(x => [x.image,x]));
-    const crystalByInvId = new Map(crystalCards.filter(x => x.equipmentInvId).map(x => [String(x.equipmentInvId),x]));
+    const inventoryRecords = parseUnequippedEquipment(attackDoc);
     for (const item of Object.values(equipped)) {
       const resolved = resolveEquipmentInventoryId(item, inventoryRecords);
       if (resolved) item.invId = resolved;
-      const card = (item.invId && crystalByInvId.get(String(item.invId))) || crystalByImage.get(item.image);
+    }
+    if (Object.values(equipped).some(item => !item.invId)) {
+      const extraPages = await Promise.all([
+        loadoutRequest('/inventory.php', { params:{ set:'pvp_attack' }, expect:'text' }).catch(() => ''),
+        loadoutRequest('/inventory.php', { params:{ set:'defense' }, expect:'text' }).catch(() => '')
+      ]);
+      for (const html of extraPages) if (html) inventoryRecords.push(...parseUnequippedEquipment(docFromHtml(html)));
+      for (const item of Object.values(equipped)) if (!item.invId) {
+        const resolved = resolveEquipmentInventoryId(item, inventoryRecords);
+        if (resolved) item.invId = resolved;
+      }
+    }
+    const crystalCards = parseCrystalEquipment(docFromHtml(crystalHtml));
+    const crystalByInvId = new Map(crystalCards.filter(x => x.equipmentInvId).map(x => [String(x.equipmentInvId),x]));
+    const crystalByImage = new Map();
+    for (const card of crystalCards.filter(x => x.image)) {
+      if (!crystalByImage.has(card.image)) crystalByImage.set(card.image, []);
+      crystalByImage.get(card.image).push(card);
+    }
+    for (const item of Object.values(equipped)) {
+      const imageCards = crystalByImage.get(item.image) || [];
+      const card = (item.invId && crystalByInvId.get(String(item.invId))) || (imageCards.length === 1 ? imageCards[0] : null);
       item.crystals = card?.crystals || [];
       if (!item.invId && card?.equipmentInvId) item.invId = card.equipmentInvId;
     }
@@ -3685,15 +4274,25 @@ async function aurelixGetUpdateStatus(force = false) {
       || (!location.invId && location.image === normalizeAssetPath(item?.image))
     );
   }
-  async function mutateCrystalSafely(data, verify, label) {
+  async function mutateCrystalSafely(data, verify, label, crystalSession = null) {
     let lastError = '';
     for (let attempt=0; attempt<2; attempt++) {
-      let pageText = '';
       try {
-        pageText = await loadoutRequest('/power_crystals.php', { expect:'text' });
-        const page = docFromHtml(pageText), token = readCrystalIntent(page);
+        let page, token;
+        const cached = crystalSession?.nextPage;
+        crystalSession && (crystalSession.nextPage = null); // consume once, even on failure
+        if (cached?.doc && cached.token && cached.token !== cached.usedToken) {
+          page = cached.doc;
+          token = cached.token;
+        } else {
+          page = docFromHtml(await loadoutRequest('/power_crystals.php', { expect:'text' }));
+          token = readCrystalIntent(page);
+        }
         if (!token) throw new Error('Power Crystals page did not provide a fresh crystal_intent.');
-        if (verify(page)) return page;
+        if (verify(page)) {
+          if (crystalSession) crystalSession.nextPage = { doc:page, token, usedToken:'' };
+          return page;
+        }
         const body = new URLSearchParams({ crystal_intent:token });
         Object.entries(data).forEach(([key,value]) => body.set(key, String(value)));
         const { res, text } = await fetchText('/power_crystals.php', {
@@ -3704,7 +4303,13 @@ async function aurelixGetUpdateStatus(force = false) {
         });
         if (res.ok) {
           const resultDoc = docFromHtml(text);
-          if (verify(resultDoc)) return resultDoc;
+          if (verify(resultDoc)) {
+            const nextToken = readCrystalIntent(resultDoc);
+            if (crystalSession && nextToken && nextToken !== token) {
+              crystalSession.nextPage = { doc:resultDoc, token:nextToken, usedToken:token };
+            }
+            return resultDoc;
+          }
           lastError = `${label}: resulting crystal page did not confirm the change`;
         } else lastError = `${label}: HTTP ${res.status}`;
       } catch (error) {
@@ -3713,7 +4318,11 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       try {
         const authoritative = docFromHtml(await loadoutRequest('/power_crystals.php', { expect:'text' }));
-        if (verify(authoritative)) return authoritative;
+        if (verify(authoritative)) {
+          const freshToken = readCrystalIntent(authoritative);
+          if (crystalSession && freshToken) crystalSession.nextPage = { doc:authoritative, token:freshToken, usedToken:'' };
+          return authoritative;
+        }
       } catch (error) {
         if (error?.name === 'AbortError') throw error;
         lastError += ` | verification: ${error?.message || error}`;
@@ -3730,43 +4339,50 @@ async function aurelixGetUpdateStatus(force = false) {
     const currentCrystalLocation = new Map();
     for (const card of cards) for (const crystal of card.crystals) currentCrystalLocation.set(String(crystal.id), { invId:card.equipmentInvId ? String(card.equipmentInvId) : null, image:card.image });
     let changed = 0;
+    const initialCrystalPage = current._crystalInitialPage;
+    const initialCrystalToken = initialCrystalPage?.doc && readCrystalIntent(initialCrystalPage.doc);
+    const crystalSession = { nextPage: initialCrystalToken
+      && Date.now() - Number(initialCrystalPage.checkedAt || 0) < 5_000
+      ? {doc:initialCrystalPage.doc, token:initialCrystalToken, usedToken:''}
+      : null };
     for (const item of Object.values(desired)) for (const crystal of item.crystals || []) {
       const location = currentCrystalLocation.get(String(crystal.id));
       const correct = location && ((location.invId && location.invId === String(item.invId)) || (!location.invId && location.image === normalizeAssetPath(item.image)));
       if (!location || correct) continue;
-      const resultDoc = await mutateCrystalSafely(
+      const resultDoc = await axLoadoutTimed('crystal-unlink', () => mutateCrystalSafely(
         { action:'unequip_crystal', crystal_id:crystal.id },
         doc => !crystalLocationsFromDocument(doc).has(String(crystal.id)),
-        `Unlink crystal ${crystal.id}`
-      );
+        `Unlink crystal ${crystal.id}`, crystalSession
+      ));
       currentCrystalLocation.clear();
       for (const [id,loc] of crystalLocationsFromDocument(resultDoc)) currentCrystalLocation.set(id,loc);
-      changed++; await loadoutSleep(40);
+      changed++;
     }
+    crystalSession.nextPage = null; // equipment changes invalidate cached crystal-page state
     for (const slot of Object.keys(LOADOUT_SLOTS)) {
       const wanted = desired[slot];
       if (!wanted || equipmentItemMatches(wanted, current[slot])) continue;
       if (current[slot]) {
         const result = await equipmentPost({ action:'unequip_item', slot_id:LOADOUT_SLOTS[slot], set:'attack' });
         if (String(result).trim() !== 'OK') throw new Error(`Unequip ${slot}: ${String(result).trim()}`);
-        changed++; await loadoutSleep(40);
+        changed++;
       }
       const result = await equipmentPost({ action:'equip_item', inv_id:wanted.invId, slot_id:(slot === 'ring1' || slot === 'ring2') ? LOADOUT_SLOTS[slot] : 0, set:'attack' });
       if (String(result).trim() !== 'OK') throw new Error(`Equip ${wanted.name}: ${String(result).trim()}`);
-      changed++; await loadoutSleep(40);
+      changed++;
     }
     for (const item of Object.values(desired)) for (const crystal of item.crystals || []) {
       const location = currentCrystalLocation.get(String(crystal.id));
       const correct = location && ((location.invId && location.invId === String(item.invId)) || (!location.invId && location.image === normalizeAssetPath(item.image)));
       if (correct) continue;
-      const resultDoc = await mutateCrystalSafely(
+      const resultDoc = await axLoadoutTimed('crystal-link', () => mutateCrystalSafely(
         { action:'equip_crystal', crystal_id:crystal.id, equipment_inv_id:item.invId },
         doc => crystalLocationMatchesItem(crystalLocationsFromDocument(doc).get(String(crystal.id)), item),
-        `Link crystal ${crystal.id}`
-      );
+        `Link crystal ${crystal.id}`, crystalSession
+      ));
       currentCrystalLocation.clear();
       for (const [id,loc] of crystalLocationsFromDocument(resultDoc)) currentCrystalLocation.set(id,loc);
-      changed++; await loadoutSleep(40);
+      changed++;
     }
     if (verify && !equipmentPresetMatches(preset, await fetchEquipmentSnapshot())) throw new Error('Equipment and crystal verification failed.');
     return changed;
@@ -3831,6 +4447,9 @@ async function aurelixGetUpdateStatus(force = false) {
       return petRecordFromCard(candidate.inv_id, candidate.name || pet?.name, candidate.img || pet?.image);
     }).sort((a,b) => a.name.localeCompare(b.name));
   }
+  function petFormationSlot(preset, slot) {
+    return preset?.slots?.[slot] || preset?.slots?.[String(slot)] || null;
+  }
   function emptyPetFormationSlot() {
     return { main:null, links:{ 1:null, 2:null }, attachmentsCaptured:false, attachments:emptyPetAttachments() };
   }
@@ -3865,8 +4484,8 @@ async function aurelixGetUpdateStatus(force = false) {
   function validatePetFormation(preset) {
     const used = new Set();
     for (let slot=1; slot<=3; slot++) {
-      const cfg = preset?.slots?.[slot] || preset?.slots?.[String(slot)];
-      if (!cfg?.main?.id) throw new Error(`Main Pet Slot ${slot} is empty.`);
+      const cfg = petFormationSlot(preset, slot);
+      if (!cfg?.main?.id) throw new Error(`Select a main pet for Slot ${slot}.`);
       const mainId = String(cfg.main.id);
       if (used.has(mainId)) throw new Error(`${cfg.main.name || `Pet ${mainId}`} is used more than once.`);
       used.add(mainId);
@@ -3890,6 +4509,7 @@ async function aurelixGetUpdateStatus(force = false) {
     if (String(state.activeLoadout.petPresetId || '') === String(preset.id)) {
       state.activeLoadout.petPresetId = null;
       state.activeLoadout.detected = false;
+      state.loadoutSnapshotCache = { equipment:null, pets:null, checkedAt:0 };
     }
     state.failedLoadoutGroups.clear();
     state.failedLoadoutAt.clear();
@@ -3970,33 +4590,67 @@ async function aurelixGetUpdateStatus(force = false) {
     return false;
   }
   async function applyCapturedPetAttachments(preset) {
-    let changed = 0;
+    const jobs = [], seen = new Set();
     for (let slot=1; slot<=3; slot++) {
-      const cfg = preset?.slots?.[slot] || preset?.slots?.[String(slot)];
-      const pets = [cfg?.main, cfg?.links?.[1], cfg?.links?.[2]];
-      for (const pet of pets) {
-        if (!pet?.id || pet.attachmentsCaptured !== true) continue;
-        for (const type of ['attack','defense','elemental']) {
-          if (await setPetAttachment(pet.id, type, pet.attachments?.[type] || null)) {
-            changed++;
-            await loadoutSleep(20);
-          }
-        }
+      const cfg = petFormationSlot(preset, slot);
+      for (const pet of [cfg?.main, cfg?.links?.[1], cfg?.links?.[2]]) {
+        if (!pet?.id || pet.attachmentsCaptured !== true || seen.has(String(pet.id))) continue;
+        seen.add(String(pet.id));
+        for (const type of ['attack','defense','elemental']) jobs.push({ pet, type });
       }
     }
+    if (!jobs.length) return 0;
+    const snapshots = new Array(jobs.length);
+    let next = 0;
+    const workers = Array.from({length:Math.min(4, jobs.length)}, async () => {
+      while (next < jobs.length) {
+        const index = next++;
+        const job = jobs[index];
+        snapshots[index] = await fetchPetAttachmentState(job.pet.id, job.type);
+      }
+    });
+    await Promise.all(workers);
+    let changed = 0, skipped = 0;
+    for (let i=0; i<jobs.length; i++) {
+      const {pet,type} = jobs[i];
+      const desired = pet.attachments?.[type] || null;
+      const desiredId = desired?.item_id ? String(desired.item_id) : '';
+      const currentId = snapshots[i]?.current?.item_id ? String(snapshots[i].current.item_id) : '';
+      if (currentId === desiredId) { skipped++; continue; }
+      if (await setPetAttachment(pet.id, type, desired)) changed++;
+    }
+    AURELIX_TRACE.record('loadout-attachment-summary', {jobs:jobs.length, skipped, changed});
     return changed;
   }
-  async function fetchPetSnapshot() {
-    const html = await loadoutRequest('/pets.php', { params:{ team:'attack' }, expect:'text' });
-    const doc = docFromHtml(html), result = {}, equipped = [];
+  function parseEquippedPetTeam(doc) {
+    const result = {}, equipped = [];
     for (const card of doc.querySelectorAll('.slot-box.pet-card')) {
-      const button = [...card.querySelectorAll('button')].find(x => normalizeName(x.textContent) === 'unequip');
-      const slot = Number((button?.getAttribute('onclick') || '').match(/unequipPet\s*\(\s*(\d+)/)?.[1]);
-      const id = card.dataset.petInvId || card.getAttribute('data-pet-inv-id');
+      const unequip = card.querySelector('[onclick*="unequipPet"]');
+      const onclick = unequip?.getAttribute('onclick') || '';
+      const slot = Number(onclick.match(/unequipPet\s*\(\s*(\d+)/i)?.[1]
+        || card.dataset.slotId || card.getAttribute('data-slot-id') || card.dataset.slot || 0);
+      const id = card.dataset.petInvId || card.getAttribute('data-pet-inv-id')
+        || card.outerHTML.match(/(?:showEquipModal|openLinksModal)\s*\(\s*(\d+)/i)?.[1];
       if (!id || slot < 1 || slot > 3) continue;
       const image = card.querySelector('img');
       const pet = petRecordFromCard(id, image?.alt?.trim(), image?.getAttribute('src'));
       equipped.push({ slot, pet });
+    }
+    return { result, equipped };
+  }
+  async function fetchPetSnapshot({ requireComplete = false } = {}) {
+    let parsed = null;
+    for (let attempt=0; attempt<2; attempt++) {
+      const html = await loadoutRequest('/pets.php', {
+        params:{ team:'attack', ...(attempt ? { aurelix_fresh:Date.now() } : {}) }, expect:'text'
+      });
+      parsed = parseEquippedPetTeam(docFromHtml(html));
+      if (parsed.equipped.length === 3 || !requireComplete) break;
+    }
+    const { result, equipped } = parsed || { result:{}, equipped:[] };
+    if (requireComplete && equipped.length !== 3) {
+      const found = [...new Set(equipped.map(x => x.slot))].sort().join(', ') || 'none';
+      throw new Error(`Could not detect all three equipped PvE main pets (detected slots: ${found}). Open the PvE pet team once, then retry.`);
     }
     const linkStates = await Promise.all(equipped.map(x => fetchPetLinkState(x.pet.id)));
     equipped.forEach(({ slot, pet }, index) => {
@@ -4020,12 +4674,22 @@ async function aurelixGetUpdateStatus(force = false) {
     return true;
   }
   async function capturePetPreset(name, { persist = true } = {}) {
-    const current = await fetchPetSnapshot(), now = Date.now();
-    if (Object.keys(current).length !== 3) throw new Error('All three PvE main-pet slots must be equipped before saving.');
+    const current = await fetchPetSnapshot({ requireComplete:true }), now = Date.now();
+    if (Object.keys(current).length !== 3) throw new Error('Could not read the complete equipped PvE pet team.');
+    const attachmentIds = new Set();
+    for (let slot=1; slot<=3; slot++) {
+      const main = current[slot];
+      attachmentIds.add(String(main.id));
+      for (const link of main._linkState?.links || []) {
+        const id = link.inv_id ?? link.link_pet_id;
+        if (id) attachmentIds.add(String(id));
+      }
+    }
+    const capturedAttachments = new Map(await Promise.all([...attachmentIds].map(async id => [id, await capturePetAttachments(id)])));
     const slots = {};
     for (let slot=1; slot<=3; slot++) {
       const main = current[slot];
-      const mainAttachments = await capturePetAttachments(main.id);
+      const mainAttachments = capturedAttachments.get(String(main.id));
       slots[slot] = {
         main:petRecordFromCard(main.id, main.name, main.image, true, mainAttachments),
         links:{ 1:null, 2:null },
@@ -4036,7 +4700,7 @@ async function aurelixGetUpdateStatus(force = false) {
       for (const link of data.links || []) {
         const level = Number(link.link_level), id = link.inv_id ?? link.link_pet_id;
         if ((level === 1 || level === 2) && id) {
-          const linkedAttachments = await capturePetAttachments(id);
+          const linkedAttachments = capturedAttachments.get(String(id));
           slots[slot].links[level] = petRecordFromCard(id, link.name, link.img, true, linkedAttachments);
         }
       }
@@ -4092,10 +4756,13 @@ async function aurelixGetUpdateStatus(force = false) {
     validatePetFormation(preset);
     const current = initialCurrent || await fetchPetSnapshot();
     const formationAlreadyMatched = petPresetMatches(preset, current);
-    if (formationAlreadyMatched && !presetHasCapturedPetAttachments(preset)) return 0;
+    const sameVerifiedPreset = state.activeLoadout.detected
+      && String(state.activeLoadout.petPresetId || '') === String(preset.id || '')
+      && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS;
+    if (formationAlreadyMatched && (!presetHasCapturedPetAttachments(preset) || sameVerifiedPreset)) return 0;
     const desiredMainIds = new Set(), desiredLinkUsage = new Map();
     for (let slot=1; slot<=3; slot++) {
-      const cfg = preset.slots[slot] || preset.slots[String(slot)];
+      const cfg = petFormationSlot(preset, slot);
       if (!cfg?.main?.id) throw new Error(`Pet preset slot ${slot} is empty.`);
       desiredMainIds.add(String(cfg.main.id));
       for (let level=1; level<=2; level++) if (cfg.links?.[level]?.id) desiredLinkUsage.set(String(cfg.links[level].id), String(cfg.main.id));
@@ -4112,7 +4779,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const data = currentStates.get(mainId);
       let desiredCfg = null;
       for (let slot=1; slot<=3; slot++) {
-        const cfg = preset.slots[slot] || preset.slots[String(slot)];
+        const cfg = petFormationSlot(preset, slot);
         if (String(cfg?.main?.id) === mainId) desiredCfg = cfg;
       }
       for (let level=1; level<=2; level++) {
@@ -4121,17 +4788,17 @@ async function aurelixGetUpdateStatus(force = false) {
         if (!existingId) continue;
         const desiredId = desiredCfg?.links?.[level]?.id || '';
         const mustRemove = desiredCfg ? String(existingId) !== String(desiredId) : (desiredLinkUsage.has(String(existingId)) && desiredLinkUsage.get(String(existingId)) !== mainId);
-        if (mustRemove && await petUnlinkKnown(mainId, level, data)) { changed++; await loadoutSleep(25); }
+        if (mustRemove && await petUnlinkKnown(mainId, level, data)) { changed++; }
       }
     }
     const changedMainIds = new Set();
     for (let slot=1; slot<=3; slot++) {
-      const desired = (preset.slots[slot] || preset.slots[String(slot)]).main;
+      const desired = petFormationSlot(preset, slot).main;
       if (String(current[slot]?.id || '') === String(desired.id)) continue;
       const result = await loadoutRequest('/inventory_ajax.php', { method:'POST', params:{ action:'equip_pet', team:'attack', pet_inv_id:desired.id, slot_id:slot }, expect:'text' });
       if (String(result).trim() !== 'OK') throw new Error(String(result).trim() || `Could not equip ${desired.name}.`);
       changedMainIds.add(String(desired.id));
-      changed++; await loadoutSleep(25);
+      changed++;
     }
     const desiredStateIds = [...desiredMainIds];
     const refreshStateIds = desiredStateIds.filter(id => changedMainIds.has(id) || !currentStates.has(id));
@@ -4139,12 +4806,12 @@ async function aurelixGetUpdateStatus(force = false) {
     const desiredStateById = new Map(desiredStateIds.map(id => [id, currentStates.get(id)]));
     refreshStateIds.forEach((id, index) => desiredStateById.set(id, refreshedStates[index]));
     for (let slot=1; slot<=3; slot++) {
-      const cfg = preset.slots[slot] || preset.slots[String(slot)];
+      const cfg = petFormationSlot(preset, slot);
       const data = desiredStateById.get(String(cfg.main.id));
-      for (let level=1; level<=2; level++) if (cfg.links?.[level]?.id && await petLinkKnown(cfg.main.id, level, cfg.links[level].id, data)) { changed++; await loadoutSleep(25); }
+      for (let level=1; level<=2; level++) if (cfg.links?.[level]?.id && await petLinkKnown(cfg.main.id, level, cfg.links[level].id, data)) { changed++; }
     }
-    changed += await applyCapturedPetAttachments(preset);
-    if (verify && !petPresetMatches(preset, await fetchPetSnapshot())) throw new Error('Pet preset verification failed.');
+    changed += await axLoadoutTimed('pet-attachments', () => applyCapturedPetAttachments(preset));
+    if (verify && !petPresetMatches(preset, await fetchPetSnapshot({ requireComplete:true }))) throw new Error('Pet preset verification failed.');
     return changed;
   }
   function resetAllDamageCalibration(reason) {
@@ -4157,37 +4824,66 @@ async function aurelixGetUpdateStatus(force = false) {
     const normalized = normalizeLoadoutAssignment(assignment), groupKey = loadoutGroupKey(normalized);
     if (manual && state.status === ENGINE_STATES.RUNNING) throw new Error('Stop AURELIX before manually equipping a preset.');
     if (state.loadoutPromise) return state.loadoutPromise;
+    if (!manual && state.activeLoadout.detected
+        && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS
+        && activeLoadoutMatches(normalized)) {
+      return { ok:true, changed:0, cached:true };
+    }
     state.loadoutPromise = (async () => {
       state.loadoutInFlight = true; emit();
       const loadoutStartedAt = performance.now();
+      const axTrace = {id:Date.now(), stage:null, stageAt:0, requests:0, requestMs:0};
+      axLoadoutTrace = axTrace;
+      axLoadoutStage('resolve-preset');
       let changed = 0;
       try {
         const equipment = normalized.equipmentPresetId ? equipmentPresetById(normalized.equipmentPresetId) : null;
         const pets = normalized.petPresetId ? petPresetById(normalized.petPresetId) : null;
         if (normalized.equipmentPresetId && !equipment) throw new Error(`Equipment preset ${normalized.equipmentPresetId} is missing.`);
         if (normalized.petPresetId && !pets) throw new Error(`Pet preset ${normalized.petPresetId} is missing.`);
+        const sameVerifiedPetPreset = !!pets && state.activeLoadout.detected
+          && String(state.activeLoadout.petPresetId || '') === String(pets.id || '')
+          && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS;
         if (equipment || pets) {
           state.activeLoadout.detected = false;
           state.activeLoadout.checkedAt = 0;
         }
-        const cachedSnapshot = !manual && Date.now() - Number(state.loadoutSnapshotCache.checkedAt || 0) < 5000
+        const cachedSnapshot = !manual && Date.now() - Number(state.loadoutSnapshotCache.checkedAt || 0) < 15000
           ? state.loadoutSnapshotCache
           : null;
+        axLoadoutStage('initial-snapshots');
         const [equipmentSnapshot, petSnapshot] = await Promise.all([
           equipment ? (cachedSnapshot?.equipment || fetchEquipmentSnapshot()) : Promise.resolve(null),
           pets ? (cachedSnapshot?.pets || fetchPetSnapshot()) : Promise.resolve(null)
         ]);
         const equipmentMatched = !equipment || equipmentPresetMatches(equipment, equipmentSnapshot);
-        const petsMatched = !pets || (petPresetMatches(pets, petSnapshot) && !presetHasCapturedPetAttachments(pets));
-        if (equipment && !equipmentMatched) {
-          pushLog('system', `Applying equipment preset “${equipment.name}”…`);
-          changed += await applyEquipmentPreset(equipment, equipmentSnapshot, { verify:false });
-        }
-        if (pets && !petsMatched) {
-          pushLog('system', `Applying pet preset “${pets.name}”…`);
-          changed += await applyPetPreset(pets, petSnapshot, { verify:false });
+        const petsMatched = !pets || (petPresetMatches(pets, petSnapshot)
+          && (!presetHasCapturedPetAttachments(pets) || sameVerifiedPetPreset));
+        const needsEquipment = !!equipment && !equipmentMatched;
+        const needsPets = !!pets && !petsMatched;
+        if (needsEquipment || needsPets) {
+          axLoadoutStage(needsEquipment && needsPets
+            ? 'equipment-and-pets-concurrent'
+            : needsEquipment ? 'equipment-and-crystal-changes' : 'pet-formation-links-attachments');
+          if (needsEquipment) pushLog('system', `Applying equipment preset “${equipment.name}”…`);
+          if (needsPets) pushLog('system', `Applying pet preset “${pets.name}”…`);
+          const results = await Promise.allSettled([
+            needsEquipment
+              ? axLoadoutTimed('apply-equipment-preset', () => applyEquipmentPreset(equipment, equipmentSnapshot, { verify:false }))
+              : Promise.resolve(0),
+            needsPets
+              ? axLoadoutTimed('apply-pet-preset', () => applyPetPreset(pets, petSnapshot, { verify:false }))
+              : Promise.resolve(0)
+          ]);
+          changed += results.reduce((total, result) => total + (result.status === 'fulfilled' ? Number(result.value || 0) : 0), 0);
+          const failed = results.filter(result => result.status === 'rejected');
+          if (failed.length) {
+            const message = failed.map(result => String(result.reason?.message || result.reason)).join(' | ');
+            throw new Error(`Loadout switching failed: ${message}`);
+          }
         }
         if (!equipmentMatched || !petsMatched) {
+          axLoadoutStage('final-verification');
           const [verifiedEquipment, verifiedPets] = await Promise.all([
             equipment && !equipmentMatched ? fetchEquipmentSnapshot() : Promise.resolve(equipmentSnapshot),
             pets && !petsMatched ? fetchPetSnapshot() : Promise.resolve(petSnapshot)
@@ -4198,6 +4894,7 @@ async function aurelixGetUpdateStatus(force = false) {
         } else {
           state.loadoutSnapshotCache = { equipment:equipmentSnapshot, pets:petSnapshot, checkedAt:Date.now() };
         }
+        axLoadoutStage('commit-verified-state');
         if (normalized.equipmentPresetId) state.activeLoadout.equipmentPresetId = normalized.equipmentPresetId;
         if (normalized.petPresetId) state.activeLoadout.petPresetId = normalized.petPresetId;
         state.activeLoadout.detected = true; state.activeLoadout.checkedAt = Date.now();
@@ -4213,7 +4910,12 @@ async function aurelixGetUpdateStatus(force = false) {
         state.activeLoadout = { equipmentPresetId:null, petPresetId:null, detected:false, checkedAt:0 };
         state.loadoutSnapshotCache = { equipment:null, pets:null, checkedAt:0 };
         throw error;
-      } finally { state.loadoutInFlight = false; state.loadoutPromise = null; emit(); }
+      } finally {
+        axLoadoutStage('complete');
+        AURELIX_TRACE.record('loadout-complete', {operation:axTrace.id, ms:performance.now()-loadoutStartedAt, changed});
+        if (axLoadoutTrace === axTrace) axLoadoutTrace = null;
+        state.loadoutInFlight = false; state.loadoutPromise = null; emit();
+      }
     })();
     return state.loadoutPromise;
   }
@@ -4230,27 +4932,40 @@ async function aurelixGetUpdateStatus(force = false) {
     const detectionFresh = state.activeLoadout.detected && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS;
     if (target?.phaseWaiting && state.activeLoadout.detected && activeLoadoutMatches(assignment)) return true;
     if (detectionFresh && activeLoadoutMatches(assignment)) return true;
-    try { await applyLoadoutAssignment(assignment); return true; }
-    catch (error) {
-      if (error?.name === 'AbortError') throw error;
-      state.failedLoadoutGroups.add(groupKey);
-      const isNetworkFailure = /timed?\s*out|network|failed\s+to\s+fetch|load\s+failed/i.test(String(error?.message || error));
-      state.failedLoadoutAt.set(
-        groupKey,
-        isNetworkFailure ? Date.now() - (LOADOUT_FAILURE_RETRY_MS - 5_000) : Date.now()
-      );
-      state.session.stats.errors += 1;
-      pushLog(
-        isNetworkFailure ? 'warning' : 'error',
-        isNetworkFailure ? `Could not prepare ${target?.name || 'target'}'s assigned loadout because the server did not respond in time. Retrying shortly.` : `Could not prepare ${target?.name || 'target'}'s assigned loadout: ${error?.message || error}`
-      );
-      decideNow();
-      return false;
+    const transientLoadoutError = error => /\b(?:HTTP\s*)?(?:502|503|504|520|521|522|523|524)\b|timed?\s*out|network|failed\s+to\s+fetch|load\s+failed/i.test(String(error?.message || error));
+    let error = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (state.status !== ENGINE_STATES.RUNNING) return false;
+      try {
+        await applyLoadoutAssignment(assignment);
+        return true;
+      } catch (caught) {
+        if (caught?.name === 'AbortError') throw caught;
+        error = caught;
+        if (!transientLoadoutError(caught) || attempt === 2) break;
+        const delay = attempt === 0 ? 1000 : 2000;
+        pushLog('warning', `Temporary server error preparing ${target?.name || 'target'}'s loadout. Rechecking and retrying the same target in ${delay / 1000}s (${attempt + 1}/2).`);
+        await sleep(delay);
+      }
     }
+    state.failedLoadoutGroups.add(groupKey);
+    const isNetworkFailure = transientLoadoutError(error);
+    state.failedLoadoutAt.set(groupKey, isNetworkFailure
+      ? Date.now() - (LOADOUT_FAILURE_RETRY_MS - 5_000)
+      : Date.now());
+    state.session.stats.errors += 1;
+    pushLog(isNetworkFailure ? 'warning' : 'error',
+      `Could not prepare ${target?.name || 'target'}'s assigned loadout after verification${isNetworkFailure ? ' and two retries' : ''}: ${error?.message || error}`);
+    decideNow();
+    return false;
   }
   async function detectActiveLoadout() {
     if (state.loadoutInFlight) return clone(state.activeLoadout);
     if (state.loadoutDetectionPromise) return state.loadoutDetectionPromise;
+    if (state.activeLoadout.detected
+        && Date.now() - Number(state.activeLoadout.checkedAt || 0) < LOADOUT_VERIFY_TTL_MS) {
+      return clone(state.activeLoadout);
+    }
     state.loadoutDetectionPromise = (async () => {
       const [equipment, pets] = await Promise.all([fetchEquipmentSnapshot(), fetchPetSnapshot()]);
       state.loadoutSnapshotCache = { equipment, pets, checkedAt:Date.now() };
@@ -4276,15 +4991,15 @@ async function aurelixGetUpdateStatus(force = false) {
   async function updateLoadoutPreset(kind, id) {
     const listKey = kind === 'equipment' ? 'equipmentPresets' : 'petPresets';
     const storeKey = kind === 'equipment' ? ENGINE_STORE.equipmentPresets : ENGINE_STORE.petPresets;
-    const current = state[listKey].find(x => String(x.id) === String(id));
+    const index = state[listKey].findIndex(x => String(x.id) === String(id));
+    const current = index >= 0 ? state[listKey][index] : null;
     if (!current) throw new Error('Preset no longer exists.');
     const fresh = kind === 'equipment'
       ? await captureEquipmentPreset(current.name, { persist:false })
       : await capturePetPreset(current.name, { persist:false });
-    state[listKey] = state[listKey].filter(x => String(x.id) !== String(id));
     fresh.id = String(id); fresh.name = current.name; fresh.updatedAt = Date.now();
-    state[listKey].push(fresh);
-    saveObject(storeKey, state[listKey]);
+    state[listKey][index] = fresh;
+    if (!saveObject(storeKey, state[listKey])) throw new Error('Updated preset could not be saved permanently.');
     if (kind === 'equipment' && String(state.activeLoadout.equipmentPresetId || '') === String(id)) state.activeLoadout.equipmentPresetId = null;
     if (kind === 'pet' && String(state.activeLoadout.petPresetId || '') === String(id)) state.activeLoadout.petPresetId = null;
     state.activeLoadout.detected = false;
@@ -4607,6 +5322,7 @@ async function aurelixGetUpdateStatus(force = false) {
     body.set('monster_id', String(carrier.monsterId ?? carrier.runtimeId));
     body.set('skill_id', String(skill.skillId));
     body.set('stamina_cost', String(skill.requestStaminaCost ?? 1));
+    await awaitCombatPace();
     const { res, text } = await fetchText('/damage.php', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -4615,7 +5331,9 @@ async function aurelixGetUpdateStatus(force = false) {
     });
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get('Retry-After'));
-      await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2000);
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2000;
+      combatPaceLimited(waitMs);
+      await sleep(waitMs);
       return { ok: true, cooldownOnly: true };
     }
     if (isTransientServerStatus(res.status)) {
@@ -4655,6 +5373,7 @@ async function aurelixGetUpdateStatus(force = false) {
       : Math.max(0, Number(skill.staminaDisplayCost) || 0);
     state.session.stats.attacks += 1;
     state.session.stats.staminaUsed += spentStamina;
+    combatPaceSucceeded();
     pushLog('skill', `✨ ${skill.name} relayed through ${carrier.name} → ${mainTarget.name}.`);
     emit();
     await sleep(state.settings.attackCooldownMs);
@@ -4858,9 +5577,6 @@ async function aurelixGetUpdateStatus(force = false) {
   function noteCombatAction(target) {
     const key = runtimeEncounterKey(target);
     if (state.combatPreflight.key === key) state.combatPreflight.actionsSinceFresh = Number(state.combatPreflight.actionsSinceFresh || 0) + 1;
-    // A confirmed combat action unlocks the next possible stamina refill. This
-    // prevents consecutive Large/Full/Adventure potion requests without an
-    // attack between them.
     state.staminaPotionAwaitingAction = false;
   }
   function acceptAuthoritativeAttackTotal(target, priorTotal, data) {
@@ -4967,6 +5683,11 @@ async function aurelixGetUpdateStatus(force = false) {
     return data?.room_status === 'cleared' || (data?.match?.ended === true && data?.match?.winner_side === 'ally');
   }
   async function handleMonsterPhase(target, phase) {
+    target.phaseWaiting = true;
+    if (state.currentTarget && sameRuntimeTarget(state.currentTarget, target)) {
+      state.currentTarget.phaseWaiting = true;
+      emit();
+    }
     pushLog('phase', `Entering Phase Duel for ${target.name}.`);
     const entered = await fetchText(phase.url, { signal: state.abortController?.signal });
     if (!entered.res.ok) {
@@ -5211,15 +5932,22 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     return changed;
   }
+  let potionResourceRefreshInFlight = null;
   async function refreshLiveResourcesAfterPotion() {
-    try {
-      const { res, text } = await fetchText('/inventory.php', { signal: state.abortController?.signal });
-      if (!res.ok) return false;
-      return updateLiveResourcesFromDocument(docFromHtml(text));
-    } catch (error) {
-      if (error?.name === 'AbortError') throw error;
-      return false;
-    }
+    if (potionResourceRefreshInFlight) return potionResourceRefreshInFlight;
+    const pending = (async () => {
+      try {
+        const { res, text } = await fetchText('/inventory.php', { signal: state.abortController?.signal });
+        if (!res.ok) return false;
+        return updateLiveResourcesFromDocument(docFromHtml(text));
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        return false;
+      }
+    })();
+    potionResourceRefreshInFlight = pending;
+    try { return await pending; }
+    finally { if (potionResourceRefreshInFlight === pending) potionResourceRefreshInFlight = null; }
   }
   async function useEmergencyPotion(kind, options = {}) {
     if (state.potionInFlight || state.status !== ENGINE_STATES.RUNNING) return false;
@@ -5251,9 +5979,6 @@ async function aurelixGetUpdateStatus(force = false) {
       const wholeFit = Math.ceil(gap / restorePerPotion);
       qty = Math.max(1, wholeFit);
     }
-    // Large, Full and Adventure stamina potions are always single-use. Small
-    // Stamina Potions restore exactly 20 each and may be sent as one calculated
-    // batch containing only the minimum quantity needed to reach max stamina.
     if (kind === 'stamina') {
       qty = 1;
       if (isSmallStaminaPotion && options.fillToMax === true && Number.isFinite(beforeStamina) && Number.isFinite(maxStamina) && maxStamina > beforeStamina) {
@@ -5264,6 +5989,9 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!(qty > 0) || !Number.isFinite(qty)) qty = 1;
     qty = Math.floor(qty);
     state.potionInFlight = true;
+    const manaTimingStart = (kind === 'mana' || kind === 'hp') ? Date.now() : 0;
+    let manaRequestFinishedAt = 0;
+    let manaRefreshFinishedAt = 0;
     try {
       const makeRequest = async requestQty => {
         const form = new FormData();
@@ -5278,6 +6006,7 @@ async function aurelixGetUpdateStatus(force = false) {
       };
       let requestQty = qty;
       let { res, text } = await makeRequest(requestQty);
+      if (manaTimingStart) manaRequestFinishedAt = Date.now();
       let data = null;
       try { data = JSON.parse(text); } catch (_) {}
       let message = normalizeSpace(data?.message || data?.error || text);
@@ -5326,7 +6055,9 @@ async function aurelixGetUpdateStatus(force = false) {
         : kind === 'mana'
           ? Number.isFinite(parseNumber(data?.mana ?? data?.current_mana))
           : Number.isFinite(parseNumber(data?.hp ?? data?.current_hp ?? data?.user_hp_after));
-      if (!potionStateConfirmed) await refreshLiveResourcesAfterPotion();
+      let inventoryConfirmed = false;
+      if (!potionStateConfirmed) inventoryConfirmed = await refreshLiveResourcesAfterPotion();
+      if (manaTimingStart) manaRefreshFinishedAt = Date.now();
       if (consumed > 0) {
         if (kind === 'mana') {
           const after = Number(currentMana());
@@ -5344,8 +6075,8 @@ async function aurelixGetUpdateStatus(force = false) {
           }
         }
       }
-      if (kind === 'hp' && !potionStateConfirmed) await sleep(100);
-      if (kind === 'hp' && !(Number(state.liveResources.hp) > 0)) {
+      const hpVerifiedNow = kind === 'hp' && (potionStateConfirmed || inventoryConfirmed) && Number(state.liveResources.hp) > 0;
+      if (kind === 'hp' && !hpVerifiedNow) {
         try {
           const target = state.currentTarget;
           if (target) {
@@ -5367,6 +6098,11 @@ async function aurelixGetUpdateStatus(force = false) {
       const limitText = limit > 0 ? `${state.potionUsage[usageKey]}/${limit}` : `${state.potionUsage[usageKey]}`;
       const icon = kind === 'hp' ? '❤' : (kind === 'mana' ? '💧' : '⚡');
       pushLog(kind === 'hp' ? 'hp' : (kind === 'mana' ? 'mana' : 'stamina'), `${icon} AUTO ${kind.toUpperCase()} — used ${consumed || 0} × ${potion.name || 'potion'} (${limitText} used).`);
+      if (manaTimingStart) {
+        const postMs = manaRequestFinishedAt - manaTimingStart;
+        const verifyMs = manaRefreshFinishedAt - manaRequestFinishedAt;
+        pushLog(kind === 'hp' ? 'hp' : 'mana', `${kind === 'hp' ? 'HP' : 'Mana'} timing: potion request ${postMs} ms; verification ${verifyMs} ms; total ${Date.now() - manaTimingStart} ms.`);
+      }
       if (kind === 'mana' && options.fillToMax === true) {
         const now = Number(currentMana());
         const max = Number(state.liveResources.manaMax);
@@ -5478,8 +6214,12 @@ async function aurelixGetUpdateStatus(force = false) {
     return value || 'Monster';
   }
   function dungeonLootCandidateFromCard(card, loc) {
-    if (!lootCardLooksDead(card) || !lootCardLooksUnclaimed(card) || lootCardExplicitlyUnjoined(card)) return null;
-    if (!lootCardLooksJoined(card) && !lootCardIsBoss(card)) return null;
+    const cardText = normalizeSpace(card.textContent || '');
+    const explicitlyNotLooted = /\bnot\s+looted\b|\bunclaimed\b/i.test(cardText) ||
+      String(card.dataset?.looted || '').toLowerCase() === '0' ||
+      String(card.dataset?.claimed || '').toLowerCase() === '0';
+    if (!lootCardLooksJoined(card) || lootCardExplicitlyUnjoined(card) ||
+        !lootCardLooksDead(card) || !lootCardLooksUnclaimed(card) || !explicitlyNotLooted) return null;
     const links = [...card.querySelectorAll('a[href],button[data-dgmid],button[data-monster-id],button[data-boss-id],[data-dgmid],[data-monster-id],[data-boss-id]')];
     let dgmid = parseNumber(card.dataset?.dgmid ?? card.dataset?.monsterId ?? card.dataset?.monster_id ?? card.dataset?.bossId ?? card.dataset?.boss_id);
     let instanceId = parseNumber(card.dataset?.instanceId ?? card.dataset?.instance_id) ?? parseNumber(loc.instanceId);
@@ -5533,21 +6273,69 @@ async function aurelixGetUpdateStatus(force = false) {
     await Promise.all(runners);
     return results;
   }
+  const DUNGEON_BATTLE_INDEX_KEY = 'aurelix_dungeon_battle_index_v1';
+  const DUNGEON_BATTLE_INDEX_MAX = 2500;
+  const DUNGEON_BATTLE_INDEX_AGE_MS = 90 * 86400000;
+  function dungeonBattleIndexRead() {
+    const rows = loadObject(DUNGEON_BATTLE_INDEX_KEY, []);
+    return Array.isArray(rows) ? rows.filter(row => {
+      if (!row || !(Number(row.instanceId) > 0) || !(Number(row.dgmid) > 0)) return false;
+      if (Date.now() - Number(row.seenAt || 0) > DUNGEON_BATTLE_INDEX_AGE_MS) return false;
+      try {
+        const u = new URL(row.battleUrl, location.origin);
+        return u.origin === location.origin && /\/battle\.php$/i.test(u.pathname) &&
+          Number(u.searchParams.get('dgmid')) === Number(row.dgmid) &&
+          Number(u.searchParams.get('instance_id')) === Number(row.instanceId);
+      } catch (_) { return false; }
+    }) : [];
+  }
+  function dungeonBattleIndexMerge(rows) {
+    if (!Array.isArray(rows) || !rows.length) return;
+    const map = new Map(dungeonBattleIndexRead().map(row => [row.key, row]));
+    for (const row of rows) {
+      if (!row || !(Number(row.instanceId) > 0) || !(Number(row.dgmid) > 0)) continue;
+      const key = `dungeon:${Number(row.instanceId)}:${Number(row.dgmid)}`;
+      let url;
+      try {
+        url = new URL(row.battleUrl || `/battle.php?dgmid=${row.dgmid}&instance_id=${row.instanceId}`, location.origin);
+        if (url.origin !== location.origin || !/\/battle\.php$/i.test(url.pathname) ||
+            Number(url.searchParams.get('dgmid')) !== Number(row.dgmid) ||
+            Number(url.searchParams.get('instance_id')) !== Number(row.instanceId)) continue;
+      } catch (_) { continue; }
+      map.set(key, { key, source:'dungeon', name:String(row.name || map.get(key)?.name || 'Dungeon monster').slice(0,160),
+        instanceId:Number(row.instanceId), dgmid:Number(row.dgmid),
+        locationId:Number(row.locationId) || null, battleUrl:url.href, seenAt:Date.now() });
+    }
+    saveObject(DUNGEON_BATTLE_INDEX_KEY, [...map.values()]
+      .sort((a,b) => Number(b.seenAt)-Number(a.seenAt)).slice(0,DUNGEON_BATTLE_INDEX_MAX));
+  }
+  function dungeonBattleIndexForget(key) {
+    const rows = dungeonBattleIndexRead().filter(row => row.key !== key);
+    saveObject(DUNGEON_BATTLE_INDEX_KEY, rows);
+  }
   async function discoverDungeonLootCandidates() {
     const report = window.AURELIX?.getReport?.();
     const locations = Array.isArray(report?.dungeonLocations)
       ? report.dungeonLocations.filter(loc => loc?.url && Number(loc.instanceId) > 0)
       : [];
-    if (!locations.length) return [];
-    const batches = await mapWithConcurrency(locations, 4, async loc => {
+    const scanRecords = (Array.isArray(report?.entities) ? report.entities : [])
+      .filter(entity => entity?.source === 'dungeon' && Number(entity.instanceId) > 0 &&
+        Number(entity.dgmid ?? entity.runtimeId) > 0)
+      .map(entity => ({ source:'dungeon', instanceId:Number(entity.instanceId),
+        dgmid:Number(entity.dgmid ?? entity.runtimeId), locationId:Number(entity.locationId)||null,
+        name:entity.name, battleUrl:entity.battleUrl }));
+    dungeonBattleIndexMerge(scanRecords);
+    const batches = await mapWithConcurrency(locations, 6, async loc => {
       if (state.status !== ENGINE_STATES.RUNNING) return [];
       try {
         const { res, text } = await withGateDeadViewRequest(() => fetchText(loc.url, { signal: state.abortController?.signal }));
         if (!res.ok) return [];
         const doc = docFromHtml(text);
         updateLiveResourcesFromDocument(doc);
-        const rawCards = [...doc.querySelectorAll('.mon,.monster-card,.boss-card,.dungeon-boss,[data-dgmid],[data-monster-id],[data-boss-id],a[href*="dgmid="]')];
-        const cards = [...new Set(rawCards.map(node => node.closest?.('.mon,.monster-card,.boss-card,.dungeon-boss,[data-dgmid],[data-monster-id],[data-boss-id]') || node))];
+        const rowSelector = '.mon,.monster-card,.boss-card,.dungeon-boss,[data-dgmid],[data-monster-id],[data-boss-id],[data-boss_id],.monster-row,.monster-entry,.mob-card';
+        const rawCards = [...doc.querySelectorAll(`${rowSelector},a[href*="dgmid="],a[href*="battle.php?"],button[data-dgmid]`)];
+        const cards = [...new Set(rawCards.map(node => node.closest?.(rowSelector) ||
+          node.closest?.('article,li,.card,.row') || node))];
         return cards
           .filter((card, index, all) => !all.some((other, otherIndex) => otherIndex < index && other.contains(card)))
           .map(card => dungeonLootCandidateFromCard(card, loc))
@@ -5559,12 +6347,29 @@ async function aurelixGetUpdateStatus(force = false) {
     });
     const seen = new Set();
     const out = [];
+    for (const entity of Array.isArray(report?.entities) ? report.entities : []) {
+      if (entity?.source !== 'dungeon' || entity.status !== 'dead' || !entity.battleUrl ||
+          entity.joined !== true || entity.looted !== false) continue;
+      const instanceId = Number(entity.instanceId), dgmid = Number(entity.dgmid ?? entity.runtimeId);
+      if (!(instanceId > 0 && dgmid > 0)) continue;
+      const key = `dungeon:${instanceId}:${dgmid}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ source: 'dungeon', name: entity.name || 'Dungeon monster', instanceId,
+        locationId: Number(entity.locationId) || null, dgmid, battleUrl: entity.battleUrl, key });
+    }
     for (const batch of batches) {
       for (const candidate of batch || []) {
         if (!candidate || seen.has(candidate.key)) continue;
         seen.add(candidate.key);
         out.push(candidate);
       }
+    }
+    dungeonBattleIndexMerge(out);
+    for (const record of dungeonBattleIndexRead()) {
+      if (seen.has(record.key)) continue;
+      seen.add(record.key);
+      out.push(record);
     }
     return out;
   }
@@ -5733,8 +6538,8 @@ async function aurelixGetUpdateStatus(force = false) {
     const m = String(text || '').match(/(?:EXP|XP)\s*(?:gained|earned)?\s*[:+]\s*([\d,]+)/i);
     return m ? Math.max(0, parseNumber(m[1]) || 0) : 0;
   }
-  async function claimOneLoot(candidate) {
-    const verified = await verifyLootCandidate(candidate);
+  async function claimOneLoot(candidate, preverified = undefined) {
+    const verified = preverified === undefined ? await verifyLootCandidate(candidate) : preverified;
     if (!verified) {
       const retryAt = Date.now() + LOOT_REJECT_COOLDOWN_MS;
       state.lootCandidateRejectedUntil.set(candidate.key, retryAt);
@@ -5777,6 +6582,7 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     const expGained = extractLootExp(data, text);
     state.lootCandidateRejectedUntil.delete(candidate.key);
+    if (candidate.source === 'dungeon') dungeonBattleIndexForget(candidate.key);
     state.session.stats.xpLooted += expGained;
     state.session.stats.mobsLooted += 1;
     state.session.stats.mobsUnlooted = Math.max(0, Number(state.session.stats.mobsUnlooted || 0) - 1);
@@ -5804,28 +6610,34 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     const attempted = new Set();
     let claimedAny = false;
-    for (const candidate of queue) {
+    const dungeonRecovery = stopOnRecovery && queue.length > 0 && queue.every(c => c.source === 'dungeon');
+    const batchSize = dungeonRecovery ? 4 : 1;
+    for (let offset = 0; offset < queue.length; offset += batchSize) {
       if (state.status !== ENGINE_STATES.RUNNING) break;
-      if (attempted.has(candidate.key)) continue;
-      attempted.add(candidate.key);
-      const result = await claimOneLoot(candidate);
-      if (!result.ok) continue;
-      claimedAny = true;
-      if (!stopOnRecovery) {
-        await sleep(20);
-        continue;
-      }
-      await sleep(40);
-      const after = await fetchFreshPlayerState();
-      if (after) {
-        if (startingLevel > 0 && Number(after.level) > startingLevel) {
+      const batch = queue.slice(offset, offset + batchSize);
+      const verifiedBatch = dungeonRecovery
+        ? await mapWithConcurrency(batch, 4, candidate => verifyLootCandidate(candidate))
+        : null;
+      for (let i = 0; i < batch.length; i++) {
+        if (state.status !== ENGINE_STATES.RUNNING) break;
+        const candidate = batch[i];
+        if (attempted.has(candidate.key)) continue;
+        attempted.add(candidate.key);
+        const result = await claimOneLoot(candidate, verifiedBatch ? verifiedBatch[i] : undefined);
+        if (!result.ok) continue;
+        claimedAny = true;
+        if (!stopOnRecovery) {
+          await sleep(20);
+          continue;
+        }
+        const after = await fetchFreshPlayerState();
+        if (after && startingLevel > 0 && Number(after.level) > startingLevel) {
           if (!(after.stamina > 0) && Number.isFinite(after.staminaMax) && after.staminaMax > 0) state.liveResources.stamina = after.staminaMax;
           pushLog('success', `🎉 AUTO LOOT — LEVEL UP ${startingLevel} → ${after.level}.`);
           emit();
           return 'recovered';
         }
       }
-      await sleep(20);
     }
     return claimedAny ? 'claimed' : 'none';
   }
@@ -5834,8 +6646,6 @@ async function aurelixGetUpdateStatus(force = false) {
     if (state.lootInFlight) return false;
     const now = Date.now();
     const elapsed = now - Number(state.lastDungeonLootSweepAt || 0);
-    // Even emergency/forced passes must respect a hard floor. Without this,
-    // one ambiguous card can trigger several full location scans per second.
     if (elapsed < (force ? DUNGEON_LOOT_SWEEP_MIN_MS : 8000)) return false;
     if (now < Number(state.dungeonLootRetryAfter || 0)) return false;
     state.lootInFlight = true;
@@ -5845,6 +6655,7 @@ async function aurelixGetUpdateStatus(force = false) {
       const discovered = await discoverDungeonLootCandidates();
       const checkedAt = Date.now();
       const dungeonCandidates = discovered.filter(candidate => !(Number(state.lootCandidateRejectedUntil.get(candidate.key)) > checkedAt));
+      pushLog('loot', `AUTO LOOT — Parallel dungeon scan: ${discovered.length} joined + not looted + dead candidates across ${new Set(discovered.map(c => c.instanceId)).size} dungeon instances.`);
       state.session.stats.mobsUnlooted = new Set(dungeonCandidates.map(x => x.key)).size;
       emit();
       if (!dungeonCandidates.length) {
@@ -5853,8 +6664,6 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       const fresh = await fetchFreshPlayerState();
       const initialLevel = Number(fresh?.level) || null;
-      // Dungeon bosses are explicit priority loot: never reserve one of them.
-      // The emergency reserve is maintained by the Gate/Wave loot pool instead.
       const result = await processLootCandidates(dungeonCandidates, { stopOnRecovery, initialLevel, initialStamina:fresh?.stamina, reserveOne:false });
       if (result === 'recovered' || result === 'claimed') {
         state.dungeonLootRetryAfter = 0;
@@ -5903,9 +6712,6 @@ async function aurelixGetUpdateStatus(force = false) {
       pushLog('warning', 'AUTO LOOT — player level could not be verified; no loot request was sent.');
       return false;
     }
-    // Inside the configured level-up window, previous Dungeon instances are
-    // checked first, followed by every known Gate/Wave unclaimed-kill page.
-    // Each successful claim is followed by a fresh level check.
     const dungeonResult = await tryPriorityDungeonLoot({ stopOnRecovery: true, force: true });
     if (dungeonResult === 'recovered' || Number(currentExpState().level) > initialLevel) return true;
 
@@ -5957,30 +6763,49 @@ async function aurelixGetUpdateStatus(force = false) {
     if (model.samples > 0 && model.averageDamage > 0) return model.averageDamage <= remaining + tolerance;
     return remaining >= Math.max(1, Number(limit) * 0.25);
   }
+  function isUserSelectedForCombat(entity, report) {
+    if (!entity) return false;
+    if (state.currentTarget && sameRuntimeTarget(state.currentTarget, entity)) return true;
+    const key = logicalTargetKey(entity);
+    if (!key) return true; // Fail closed when policy identity cannot be established.
+    const policies = [state.targetPolicy[key]];
+    if (entity.source === 'dungeon') {
+      const loc = (report?.dungeonLocations || []).find(x =>
+        Number(x.instanceId) === Number(entity.instanceId) &&
+        Number(x.locationId) === Number(entity.locationId));
+      if (loc?.bossLabel) policies.push(state.targetPolicy[dungeonBossSlotKey(entity.dungeonName, entity.locationName || loc.name)]);
+    }
+    if (entity.source === 'gate') {
+      const root = gatePhaseRootEngine(entity.name);
+      for (const family of report?.gateBossFamilies || []) {
+        if (root && Number(family.gateId) === Number(entity.gateId) &&
+            Number(family.waveId) === Number(entity.waveId) &&
+            gatePhaseRootEngine(family.name) === root) {
+          policies.push(state.targetPolicy[`gate-family:${family.familyKey}`]);
+        }
+      }
+    }
+    return policies.some(policy => policy?.enabled === true);
+  }
   function activeSkillDiscoveryCandidates(report = window.AURELIX?.getReport?.()) {
     const entities = Array.isArray(report?.entities) ? report.entities : [];
     const out = [];
     const seen = new Set();
-    const add = target => {
-      if (!target) return;
+    for (const target of entities) {
+      if (!target || isUserSelectedForCombat(target, report)) continue;
       const hp = Number(target?.hp?.current ?? target?.currentHp);
-      const alive = target?.status === 'alive' || hp > 0;
-      if (!alive && target !== state.currentTarget) return;
-      let url = null;
+      if (!(target.status === 'alive' || hp > 0)) continue;
+      let url;
       try {
-        const runtimeId = target?.runtimeId ?? target?.monsterId ?? target?.dgmid;
-        if (!target?.battleUrl && runtimeId == null) return;
+        if (!target.battleUrl && (target.runtimeId ?? target.monsterId ?? target.dgmid) == null) continue;
         url = battleUrlFor(target);
-      } catch (_) { return; }
-      if (!url || seen.has(url)) return;
+      } catch (_) { continue; }
+      if (!url || seen.has(url)) continue;
       seen.add(url);
       out.push({ target, url });
-    };
-    add(state.currentTarget);
-    entities.filter(e => e?.targetEligible && (e?.status === 'alive' || Number(e?.hp?.current ?? e?.currentHp) > 0)).forEach(add);
-    entities.filter(e => e?.source === 'dungeon' && (e?.status === 'alive' || Number(e?.hp?.current ?? e?.currentHp) > 0)).forEach(add);
-    entities.filter(e => e?.source === 'gate' && (e?.status === 'alive' || Number(e?.hp?.current ?? e?.currentHp) > 0)).forEach(add);
-    return out.slice(0, 12);
+      if (out.length >= 12) break;
+    }
+    return out;
   }
   async function joinDiscoveryBattleWithoutAttack(candidate, doc) {
     if (!candidate?.target || !doc?.querySelector) return false;
@@ -6040,33 +6865,31 @@ async function aurelixGetUpdateStatus(force = false) {
             if (error?.name === 'AbortError') throw error;
           }
         }
-        if (joinable.length) {
-          const normalFirst = joinable.sort((a, b) => {
-            const aa = a.candidate.target?.targetEligible ? 1 : 0;
-            const bb = b.candidate.target?.targetEligible ? 1 : 0;
-            return aa - bb;
-          });
-          const pick = normalFirst[Math.floor(Math.random() * Math.min(3, normalFirst.length))] || normalFirst[0];
-          try {
-            if (await joinDiscoveryBattleWithoutAttack(pick.candidate, pick.doc)) {
-              await sleep(40);
-              const { res, text } = await fetchText(pick.candidate.url, { signal: state.abortController?.signal });
-              if (res.ok) {
-                const discovered = updateSkillCatalogFromDocument(docFromHtml(text));
-                if (discovered.length) {
-                  state.skillDiscoveryAt = Date.now();
-                  pushLog('system', `Active Skills discovered automatically (${discovered.length}) after joining a discovery battle.`);
-                  emit();
-                  return getActiveSkills();
+        if (joinable.length && !state.currentTarget && !state.discoveryJoinInFlight) {
+          const pick = joinable[0];
+          if (!isUserSelectedForCombat(pick.candidate.target, report)) {
+            state.discoveryJoinInFlight = true;
+            try {
+              if (await joinDiscoveryBattleWithoutAttack(pick.candidate, pick.doc)) {
+                await sleep(40);
+                const { res, text } = await fetchText(pick.candidate.url, { signal: state.abortController?.signal });
+                if (res.ok) {
+                  const discovered = updateSkillCatalogFromDocument(docFromHtml(text));
+                  if (discovered.length) {
+                    state.skillDiscoveryAt = Date.now();
+                    pushLog('system', `Active Skills discovered (${discovered.length}) using an unselected monster.`);
+                    emit();
+                    return getActiveSkills();
+                  }
                 }
               }
+            } finally {
+              state.discoveryJoinInFlight = false;
             }
-          } catch (error) {
-            if (error?.name === 'AbortError') throw error;
           }
         }
-        state.skillDiscoveryAt = 0;
-        pushLog('warning', `Active Skill discovery checked ${checked} live battle page${checked === 1 ? '' : 's'}${joinable.length ? ' and attempted a join-only discovery battle' : ''} but found no actionable skills.`);
+        state.skillDiscoveryAt = Date.now(); // Avoid repeatedly joining on unsuccessful discovery.
+        pushLog('warning', `Active Skill discovery checked ${checked} live battle page${checked === 1 ? '' : 's'} but found no actionable skills.`);
         return getActiveSkills();
       } catch (error) {
         if (error?.name !== 'AbortError') pushLog('warning', `Active skill discovery failed: ${error?.message || error}`);
@@ -6129,9 +6952,6 @@ async function aurelixGetUpdateStatus(force = false) {
       if (damage === 0) return true;
     }
     if (!!skillName && cleanMessage.includes(skillName) && /support\s+skill|no\s+direct\s+damage|buff|activated|applied|you\s+used/.test(cleanMessage)) return true;
-    // The skill endpoint is authoritative: an explicit success response for a
-    // known support skill means the activation was accepted even when older
-    // server responses omit logs/extra_info.
     return data.status === 'success' && !/rejected|failed|cannot|can't|not\s+allowed|error/.test(cleanMessage);
   }
   function rememberSkillAsBuff(skill) {
@@ -6174,7 +6994,8 @@ async function aurelixGetUpdateStatus(force = false) {
       } else body.set('monster_id', String(target.monsterId ?? target.runtimeId));
       body.set('skill_id', String(skill.skillId));
       body.set('stamina_cost', String(skill.requestStaminaCost ?? 1));
-      const { res, text } = await fetchText('/damage.php', {
+      await awaitCombatPace();
+    const { res, text } = await fetchText('/damage.php', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body.toString(),
@@ -6183,7 +7004,9 @@ async function aurelixGetUpdateStatus(force = false) {
       if (res.status === 429) {
         invalidateCombatPreflight(target);
         const retryAfter = Number(res.headers.get('Retry-After'));
-        await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2000);
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2000;
+      combatPaceLimited(waitMs);
+      await sleep(waitMs);
         return { ok: true, cooldownOnly: true, damage: damageBefore };
       }
       if (isTransientServerStatus(res.status)) {
@@ -6280,7 +7103,7 @@ async function aurelixGetUpdateStatus(force = false) {
       pushLog('skill', `${skillMarkPrefix}${skill.behavior === 'buff' ? '✨' : '🔥'} ${skill.name} → ${target.name}${hit > 0 ? `: +${Math.round(hit).toLocaleString()} DMG` : ': activated'} | ${Math.round(cumulative).toLocaleString()}/${Math.round(target.damageLimit).toLocaleString()}`);
       emit();
       noteCombatAction(target);
-      await sleep(state.settings.attackCooldownMs);
+      await sleep(skill.behavior === 'buff' ? 130 : state.settings.attackCooldownMs);
       return { ok: true, damage: cumulative, hit, skill };
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
@@ -6372,6 +7195,21 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     return { resolved: false, damage: previousDamage };
   }
+  const combatPacer = { intervalMs: 1200, nextAt: 0, successes: 0 };
+  async function awaitCombatPace() {
+    const remaining = combatPacer.nextAt - Date.now();
+    if (remaining > 0) await sleep(remaining);
+    combatPacer.nextAt = Date.now() + combatPacer.intervalMs;
+  }
+  function combatPaceLimited(waitMs) {
+    combatPacer.successes = 0;
+    combatPacer.intervalMs = Math.min(6000, Math.max(1500, combatPacer.intervalMs + 750));
+    combatPacer.nextAt = Math.max(combatPacer.nextAt, Date.now() + Math.max(0, waitMs));
+  }
+  function combatPaceSucceeded() {
+    combatPacer.successes = 0;
+    combatPacer.intervalMs = 1200;
+  }
   async function attackOnce(target, damageBefore, slash, forceExactSlash = false) {
     if (state.attackInFlight) return { ok: false, reason: 'attack-locked', damage: damageBefore };
     state.attackInFlight = true;
@@ -6410,6 +7248,7 @@ async function aurelixGetUpdateStatus(force = false) {
       body.set('stamina_cost', String(slash.stamina));
       let res, text;
       try {
+        await awaitCombatPace();
         ({ res, text } = await fetchText('/damage.php', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -6426,6 +7265,7 @@ async function aurelixGetUpdateStatus(force = false) {
         invalidateCombatPreflight(target);
         const retryAfter = Number(res.headers.get('Retry-After'));
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 5000;
+        combatPaceLimited(waitMs);
         pushLog('warning', `The server is rate-limiting attacks. Waiting ${Math.ceil(waitMs / 1000)}s before continuing.`);
         await sleep(waitMs);
         const resolved = await resolveUncertainAttack(target, damageBefore);
@@ -6493,6 +7333,7 @@ async function aurelixGetUpdateStatus(force = false) {
         : markEffect.cleared
           ? '🌙 Mark cleared • '
           : (markEffect.active && markEffect.total > 0 ? `🌙 Mark ${markEffect.turns}/${markEffect.total} • ` : '');
+      combatPaceSucceeded();
       pushLog('combat', `${markPrefix}${slash.name}${calibrationTag} → ${target.name}: +${Math.round(hit).toLocaleString()} DMG | ${Math.round(cumulative).toLocaleString()}/${Math.round(target.damageLimit).toLocaleString()}`);
       emit();
       noteCombatAction(target);
@@ -6504,8 +7345,7 @@ async function aurelixGetUpdateStatus(force = false) {
   }
   async function executeCombatTarget(target) {
     if (!target || state.status !== ENGINE_STATES.RUNNING) return;
-    if (!await ensureTargetLoadout(target)) return;
-    if (state.status !== ENGINE_STATES.RUNNING) return;
+    pipelineStage('decide', 'Confirming target and phase');
     let snapshot = await combatPreflight(target, true);
     if (!snapshot.ok || !snapshot.identityOk) {
       pushLog('warning', `Target state changed before combat: ${target.name}.`);
@@ -6527,20 +7367,18 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     if (target.phaseWaiting && getPhaseProgress(target).stage !== 'phase3') {
       const key = phaseProgressKey(target);
-      const lastLog = Number(state.phaseWaitLogAt[key]) || 0;
-      if (Date.now() - lastLog >= 30_000) {
-        state.phaseWaitLogAt[key] = Date.now();
-        pushLog('phase', `Waiting for Phase 2 PvP before Phase 3 damage on ${target.name}.`);
-      }
+      state.phaseDeferredUntil[key] = Date.now() + Math.max(1500, Number(state.settings.phasePollMs) || 1500);
+      pushLog('phase', `Phase Duel not yet available for ${target.name}; checking again after the phase polling interval.`);
       invalidateCombatPreflight(target);
-      const polls = Math.max(0, Number(state.phaseWaitPolls[key]) || 0) + 1;
-      state.phaseWaitPolls[key] = polls;
-      const waitMs = polls <= 2 ? Math.max(2000, state.settings.phasePollMs)
-        : polls <= 6 ? 5000
-          : 10_000;
-      await sleep(waitMs);
       return;
     }
+    if (state.status !== ENGINE_STATES.RUNNING) return;
+    pipelineStage('loadout', 'Preparing assigned loadout');
+    if (!await ensureTargetLoadout(target)) return;
+    if (state.status !== ENGINE_STATES.RUNNING) return;
+    snapshot = await combatPreflight(target, true);
+    if (!snapshot.ok || !snapshot.identityOk) { await reconcileScanner(); return; }
+    if (snapshot.phaseDuel) { decideNow(); return; }
     if (snapshot.joinRequired) {
       const joined = await joinTarget(target, snapshot);
       if (!joined) return;
@@ -6581,6 +7419,7 @@ async function aurelixGetUpdateStatus(force = false) {
         }
       }
     }
+    pipelineStage('verify', 'Checking authoritative damage');
     let damage = await authoritativeDamage(target, snapshot);
     if (!Number.isFinite(damage)) {
       pushLog('warning', `Authoritative damage could not be verified for ${target.name}; no attack sent.`);
@@ -6614,6 +7453,7 @@ async function aurelixGetUpdateStatus(force = false) {
         decideNow();
         return;
       }
+      pipelineStage('resource', 'Checking combat resources');
       const hpNow = currentHp();
       if (Number.isFinite(hpNow) && hpNow <= 0) {
         const usedPotion = await handleZeroResourceOnce();
@@ -6666,6 +7506,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
       if (markTurns(target) > 0) {
         const oneStam = { ...SLASH_TIERS[SLASH_TIERS.length - 1], estimatedDamage: null, markOverride: true };
+        pipelineStage('attack', 'Sending combat action');
         const markedResult = await attackOnce(target, damage, oneStam, true);
         if (markedResult.reason === 'phase-duel' && markedResult.phase) {
           const phaseResult = await handleMonsterPhase(target, markedResult.phase);
@@ -6689,6 +7530,7 @@ async function aurelixGetUpdateStatus(force = false) {
           softOvershootPct: state.settings.softOvershootPct
         });
         if (!calibrationSlash) return;
+        pipelineStage('attack', 'Sending combat action');
         const calibrationResult = await attackOnce(target, damage, calibrationSlash);
         if (calibrationResult.reason === 'phase-duel' && calibrationResult.phase) {
           const phaseResult = await handleMonsterPhase(target, calibrationResult.phase);
@@ -6703,9 +7545,6 @@ async function aurelixGetUpdateStatus(force = false) {
         damage = Number.isFinite(Number(calibrationResult.damage)) ? Number(calibrationResult.damage) : damage;
         continue;
       }
-      // Inside the EXP recovery window, spend one damage-safe slash of at most
-      // 10 stamina so 10-19 remaining stamina becomes <10 and loot can begin on
-      // the next loop. This replaces the old requirement to reach exactly zero.
       if (lootThreshold.eligible && stamina < AUTO_LOOT_STAMINA_TRIGGER * 2) {
         const drainSlash = encounterSlashModel.choose({
           remainingDamage: remaining,
@@ -6714,6 +7553,7 @@ async function aurelixGetUpdateStatus(force = false) {
           softOvershootPct: state.settings.softOvershootPct
         });
         if (!drainSlash) return;
+        pipelineStage('attack', 'Sending combat action');
         const drainResult = await attackOnce(target, damage, drainSlash, true);
         if (drainResult.reason === 'phase-duel' && drainResult.phase) {
           const phaseResult = await handleMonsterPhase(target, drainResult.phase);
@@ -6734,6 +7574,7 @@ async function aurelixGetUpdateStatus(force = false) {
       if (selectedSkills.directs.length) {
         const directSkill = selectedSkills.directs[state.directSkillCursor % selectedSkills.directs.length];
         state.directSkillCursor = (state.directSkillCursor + 1) % Math.max(1, selectedSkills.directs.length);
+        pipelineStage('attack', 'Sending combat action');
         skillResult = await performActiveSkill(target, damage, directSkill);
         if (skillResult.reason === 'phase-duel' && skillResult.phase) {
           const phaseResult = await handleMonsterPhase(target, skillResult.phase);
@@ -6762,7 +7603,8 @@ async function aurelixGetUpdateStatus(force = false) {
       if (Number(slash.stamina) === 1000 && selectedSkills.buffs.length) {
         let buffDeferred = false;
         for (const buffSkill of selectedSkills.buffs) {
-          skillResult = await performActiveSkill(target, damage, buffSkill);
+          pipelineStage('attack', 'Sending combat action');
+        skillResult = await performActiveSkill(target, damage, buffSkill);
           if (skillResult.reason === 'phase-duel' && skillResult.phase) break;
           if (!skillResult.ok && !skillResult.cooldownOnly) return;
           if (Number.isFinite(Number(skillResult.damage))) damage = Number(skillResult.damage);
@@ -6779,7 +7621,8 @@ async function aurelixGetUpdateStatus(force = false) {
         }
         if (buffDeferred) continue;
       }
-      const result = await attackOnce(target, damage, slash);
+      pipelineStage('attack', 'Sending combat action');
+        const result = await attackOnce(target, damage, slash);
       if (result.reason === 'phase-duel' && result.phase) {
         const phaseResult = await handleMonsterPhase(target, result.phase);
         if (!phaseResult.ok) return;
@@ -6794,6 +7637,7 @@ async function aurelixGetUpdateStatus(force = false) {
         else if (result.reason === 'dead') decideNow();
         return;
       }
+      pipelineStage('verify', 'Verifying combat result');
       damage = Number.isFinite(Number(result.damage)) ? Number(result.damage) : damage;
     }
   }
@@ -6807,11 +7651,10 @@ async function aurelixGetUpdateStatus(force = false) {
           await sleep(75);
           continue;
         }
-        await executeCombatTarget(target);
+        try { await executeCombatTarget(target); } finally { pipelineClear(); }
         state.consecutiveNetworkFailures = 0;
         if (state.status === ENGINE_STATES.RUNNING) {
           decideNow();
-          await sleep(20);
         }
       } catch (error) {
         if (error?.name === 'AbortError') break;
@@ -6825,7 +7668,7 @@ async function aurelixGetUpdateStatus(force = false) {
             state.lastNetworkWarningAt = now;
             pushLog('warning', `The server is responding slowly. Combat is paused briefly and will retry automatically. (${state.lastError})`);
           }
-          try { await sleep(Math.min(4_000, 500 * (2 ** (state.consecutiveNetworkFailures - 1)))); } catch (_) { break; }
+          try { await sleep(Math.min(2_000, 1_000 * (2 ** (state.consecutiveNetworkFailures - 1)))); } catch (_) { break; }
         } else {
           pushLog('error', `Combat could not continue because of an unexpected error: ${state.lastError}`);
           try { await sleep(500); } catch (_) { break; }
@@ -6871,6 +7714,7 @@ async function aurelixGetUpdateStatus(force = false) {
     state.encounterLedger = {};
     state.phaseWaitLogAt = {};
     state.phaseWaitPolls = {};
+    state.phaseDeferredUntil = {};
     state.markTurnsByEncounter = {};
     state.markTotalByEncounter = {};
     state.directSkillCursor = 0;
@@ -6918,8 +7762,6 @@ async function aurelixGetUpdateStatus(force = false) {
     } else {
       decideNow();
     }
-    // Loadouts and skills are discovered from the target's required combat pages.
-    // Avoid competing startup requests on slow mobile or unstable networks.
     state.dungeonLootSweepPending = state.settings.autoLoot !== false;
     ensureCombatLoop();
     emit();
@@ -6985,6 +7827,7 @@ async function aurelixGetUpdateStatus(force = false) {
       resources: { ...clone(window.AURELIX?.getReport?.()?.resources?.player || {}), ...clone(state.liveResources) },
       currentTarget: clone(state.currentTarget),
       currentPlan: clone(state.currentPlan),
+      livePipeline: livePipeline ? clone(livePipeline) : null,
       lastDecisionAt: state.lastDecisionAt,
       lastScannerSeq: state.lastScannerSeq,
       lastReportGeneratedAt: state.lastReportGeneratedAt,
@@ -6999,7 +7842,13 @@ async function aurelixGetUpdateStatus(force = false) {
       activeSkills: getActiveSkills(),
       activeSkillTargets: clone(state.skillTargetPolicy),
       slashModels: Object.fromEntries([...state.slashModels.entries()].map(([key, model]) => [key, model.snapshot()])),
-      skillDamageModels: clone(Object.fromEntries(state.skillDamageModels.entries()))
+      skillDamageModels: clone(Object.fromEntries(state.skillDamageModels.entries())),
+      scheduler: actionScheduler.snapshot(),
+      performance: {
+        ...clone(state.performance),
+        avgRequestMs: state.performance.requests ? state.performance.requestMs / state.performance.requests : 0,
+        avgDecisionMs: state.performance.decisions ? state.performance.decisionMs / state.performance.decisions : 0
+      }
     };
   }
   function getLogs() {
@@ -7048,13 +7897,19 @@ async function aurelixGetUpdateStatus(force = false) {
       equipmentPresets: saveObject(ENGINE_STORE.equipmentPresets, state.equipmentPresets),
       petPresets: saveObject(ENGINE_STORE.petPresets, state.petPresets),
       loadoutAssignments: saveObject(ENGINE_STORE.loadoutAssignments, state.loadoutAssignments),
-      snapshot: saveObject(ENGINE_STORE.manualSnapshot, snapshot)
+      snapshot: saveObject(ENGINE_STORE.manualSnapshot, snapshot),
+      checkpoint: saveObject(ENGINE_STORE.checkpoint, snapshot)
     };
     const verify = loadObject(ENGINE_STORE.manualSnapshot, {});
+    const checkpoint = loadObject(ENGINE_STORE.checkpoint, {});
     const verifiedTargets = loadObject(ENGINE_STORE.targets, {});
+    const verifiedAssignments = loadObject(ENGINE_STORE.loadoutAssignments, {});
     const verified = verify?.savedAt === savedAt &&
+      checkpoint?.savedAt === savedAt &&
       JSON.stringify(verifiedTargets) === JSON.stringify(state.targetPolicy) &&
-      JSON.stringify(verify?.targets || {}) === JSON.stringify(state.targetPolicy);
+      JSON.stringify(verify?.targets || {}) === JSON.stringify(state.targetPolicy) &&
+      JSON.stringify(verifiedAssignments) === JSON.stringify(state.loadoutAssignments) &&
+      JSON.stringify(checkpoint?.loadoutAssignments || {}) === JSON.stringify(state.loadoutAssignments);
     const ok = Object.values(results).every(Boolean) && verified;
     pushLog(ok ? 'success' : 'error', ok ? 'Configuration saved permanently.' : 'Configuration save verification failed.', { savedAt, results, verified });
     return { ok, savedAt, results, verified };
@@ -7111,7 +7966,7 @@ async function aurelixGetUpdateStatus(force = false) {
 })();
 (() => {
   'use strict';
-  const VERSION = '0.5.74';
+  const VERSION = '0.6.4';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
@@ -7122,7 +7977,8 @@ async function aurelixGetUpdateStatus(force = false) {
     effects: 'aurelix_ui_effects_v020',
     effectsRepair: 'aurelix_ui_effects_repair_v0546',
     miniX: 'aurelix_ui_mini_x_v022',
-    miniY: 'aurelix_ui_mini_y_v022'
+    miniY: 'aurelix_ui_mini_y_v022',
+    checkpoint: 'aurelix_ui_config_checkpoint_v064'
   });
   function uiStoreGet(key, fallback = null) {
     let gmValue;
@@ -7148,6 +8004,27 @@ async function aurelixGetUpdateStatus(force = false) {
     try { if (typeof GM_setValue === 'function') GM_setValue(key, String(value)); } catch (_) {}
     try { localStorage.setItem(key, String(value)); } catch (_) {}
   }
+
+
+  function restoreUiCheckpoint() {
+    let snapshot = null;
+    try {
+      snapshot = JSON.parse(String(uiStoreGet(STORE.checkpoint, '') || 'null'));
+    } catch (_) {}
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    const map = {
+      tab: STORE.tab, minimized: STORE.minimized, width: STORE.width,
+      height: STORE.height, scale: STORE.scale, theme: STORE.theme,
+      effects: STORE.effects, miniX: STORE.miniX, miniY: STORE.miniY
+    };
+    for (const [name, key] of Object.entries(map)) {
+      if (snapshot[name] !== undefined && snapshot[name] !== null && snapshot[name] !== '') {
+        uiStoreSet(key, snapshot[name]);
+      }
+    }
+    return true;
+  }
+  restoreUiCheckpoint();
 
   const DEFAULTS = Object.freeze({
     width: 920,
@@ -7540,7 +8417,298 @@ async function aurelixGetUpdateStatus(force = false) {
   @keyframes axRocketThrust { 0% { transform:translateY(1px) rotate(-.45deg); } 100% { transform:translateY(-2px) rotate(.45deg); } }
   @keyframes axRocketFlame { 0% { height:17px; width:11px; opacity:.82; } 100% { height:25px; width:15px; opacity:1; } }
 
+
+  /* ===== AURELIX v0.6 PREMIUM GAME CONTROL CONSOLE ===== */
+  #aurelix-ui {
+    --ax-console-edge: color-mix(in srgb, var(--ax-cyan) 48%, transparent);
+    --ax-console-glow: color-mix(in srgb, var(--ax-violet) 32%, transparent);
+    --ax-console-surface: linear-gradient(145deg, rgba(18,27,43,.96), rgba(7,12,22,.98));
+    border-radius:18px;
+    border:1px solid var(--ax-console-edge);
+    box-shadow:0 28px 80px rgba(0,0,0,.58),0 0 34px var(--ax-console-glow),inset 0 1px rgba(255,255,255,.07);
+  }
+  #aurelix-ui .ax-shell { background:radial-gradient(circle at 18% -10%,color-mix(in srgb,var(--ax-violet) 15%,transparent),transparent 34%),radial-gradient(circle at 88% 0%,color-mix(in srgb,var(--ax-cyan) 12%,transparent),transparent 30%); }
+  #aurelix-ui .ax-header { border-bottom:1px solid color-mix(in srgb,var(--ax-cyan) 24%,transparent); box-shadow:0 10px 30px rgba(0,0,0,.22); }
+  #aurelix-ui .ax-brand-main { letter-spacing:.12em; text-transform:uppercase; text-shadow:0 0 18px color-mix(in srgb,var(--ax-cyan) 50%,transparent); }
+  #aurelix-ui .ax-nav { padding:8px 10px; gap:6px; background:linear-gradient(180deg,rgba(5,10,19,.97),rgba(10,16,28,.94)); }
+  #aurelix-ui .ax-nav-btn {
+    position:relative; overflow:hidden; border:1px solid transparent; border-radius:10px;
+    transition:transform .13s ease,box-shadow .16s ease,border-color .16s ease,background .16s ease,color .16s ease;
+  }
+  #aurelix-ui .ax-nav-btn:hover { transform:translateY(-1px); border-color:color-mix(in srgb,var(--ax-cyan) 34%,transparent); background:color-mix(in srgb,var(--ax-cyan) 9%,transparent); }
+  #aurelix-ui .ax-nav-btn:active { transform:translateY(1px) scale(.975); }
+  #aurelix-ui .ax-nav-btn.active { color:#fff; background:linear-gradient(135deg,color-mix(in srgb,var(--ax-violet) 32%,#101827),color-mix(in srgb,var(--ax-cyan) 22%,#101827)); border-color:color-mix(in srgb,var(--ax-cyan) 50%,transparent); box-shadow:inset 0 0 18px color-mix(in srgb,var(--ax-violet) 16%,transparent),0 0 16px color-mix(in srgb,var(--ax-cyan) 12%,transparent); }
+  #aurelix-ui button:not(.ax-nav-btn) {
+    position:relative; overflow:hidden;
+    transition:transform .12s ease,filter .15s ease,box-shadow .15s ease,border-color .15s ease;
+  }
+  #aurelix-ui button:not(.ax-nav-btn):hover { filter:brightness(1.12) saturate(1.12); box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 14px color-mix(in srgb,var(--ax-cyan) 14%,transparent); }
+  #aurelix-ui button:not(.ax-nav-btn):active { transform:translateY(1px) scale(.965); filter:brightness(.94); }
+  #aurelix-ui .ax-engine-button { background:linear-gradient(135deg,#7c3aed,#2563eb 55%,#0891b2)!important; color:#fff!important; border:1px solid rgba(165,180,252,.65)!important; box-shadow:0 10px 26px rgba(37,99,235,.24),inset 0 1px rgba(255,255,255,.2); }
+  #aurelix-ui .ax-card { background:var(--ax-console-surface); border:1px solid rgba(148,163,184,.13); border-radius:14px; box-shadow:0 14px 32px rgba(0,0,0,.18),inset 0 1px rgba(255,255,255,.035); }
+  #aurelix-ui .ax-card:hover { border-color:color-mix(in srgb,var(--ax-cyan) 22%,rgba(148,163,184,.13)); }
+  #aurelix-ui .ax-card-head { background:linear-gradient(90deg,color-mix(in srgb,var(--ax-violet) 9%,transparent),transparent 55%,color-mix(in srgb,var(--ax-cyan) 6%,transparent)); }
+  #aurelix-ui .ax-premium-strip { display:grid; grid-template-columns:1.25fr .75fr; gap:12px; margin:0 0 14px; }
+  #aurelix-ui .ax-pipeline, #aurelix-ui .ax-health-console { background:linear-gradient(145deg,rgba(7,12,22,.94),rgba(18,27,43,.9)); border:1px solid rgba(148,163,184,.12); border-radius:12px; padding:12px 14px; }
+  #aurelix-ui .ax-console-label { font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:var(--ax-muted); margin-bottom:9px; font-weight:800; }
+  #aurelix-ui .ax-pipeline-track { display:flex; align-items:center; gap:6px; overflow:auto; scrollbar-width:none; }
+  #aurelix-ui .ax-pipe-node { display:flex; align-items:center; gap:6px; white-space:nowrap; font-size:10px; font-weight:800; letter-spacing:.06em; color:#64748b; }
+  #aurelix-ui .ax-pipe-node::before { content:''; width:7px; height:7px; border-radius:50%; background:#475569; box-shadow:0 0 0 3px rgba(71,85,105,.12); }
+  #aurelix-ui .ax-pipe-node.done { color:#6ee7b7; } #aurelix-ui .ax-pipe-node.done::before { background:#10b981; box-shadow:0 0 10px rgba(16,185,129,.6); }
+  #aurelix-ui .ax-pipe-node.active { color:#7dd3fc; } #aurelix-ui .ax-pipe-node.active::before { background:#38bdf8; box-shadow:0 0 12px rgba(56,189,248,.75); }
+  #aurelix-ui .ax-pipe-arrow { color:#334155; font-size:11px; }
+  #aurelix-ui .ax-health-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  #aurelix-ui .ax-health-stat { min-width:0; } #aurelix-ui .ax-health-stat span { display:block; font-size:9px; color:var(--ax-muted); text-transform:uppercase; letter-spacing:.08em; } #aurelix-ui .ax-health-stat strong { display:block; margin-top:2px; font:800 12px/1.2 "Inter",sans-serif; color:#e2e8f0; overflow:hidden; text-overflow:ellipsis; }
+  #aurelix-ui .ax-health-good { color:#34d399!important; } #aurelix-ui .ax-health-warn { color:#fbbf24!important; }
+  #aurelix-ui .ax-mode-switch { display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px; }
+  #aurelix-ui .ax-mode-btn { padding:10px 8px;border-radius:9px;border:1px solid rgba(148,163,184,.16);background:rgba(15,23,42,.7);color:#94a3b8;font-weight:800;letter-spacing:.06em; }
+  #aurelix-ui .ax-mode-btn.active { color:#fff;border-color:color-mix(in srgb,var(--ax-cyan) 55%,transparent);background:linear-gradient(135deg,color-mix(in srgb,var(--ax-violet) 35%,#111827),color-mix(in srgb,var(--ax-cyan) 25%,#111827)); }
+  #aurelix-ui .ax-target-body { background:radial-gradient(circle at 0 0,color-mix(in srgb,var(--ax-violet) 8%,transparent),transparent 38%); }
+  #aurelix-ui .ax-bar > * { transition:width .28s ease; }
+  #aurelix-ui[data-running="true"] .ax-engine-button { background:linear-gradient(135deg,#be123c,#ef4444,#f97316)!important; }
+  @media (prefers-reduced-motion:reduce) { #aurelix-ui *,#aurelix-mini * { animation:none!important;transition:none!important; } }
+
+
+  /* v0.6.2: single-row adaptive command navigation */
+  #aurelix-ui .ax-nav {
+    display:grid;
+    grid-template-columns:repeat(9,minmax(0,1fr));
+    gap:4px;
+    padding:7px 8px;
+    overflow:hidden;
+    flex-wrap:nowrap;
+    align-items:stretch;
+  }
+  #aurelix-ui .ax-nav-btn {
+    min-width:0;
+    width:100%;
+    min-height:44px;
+    padding:0 4px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:clip;
+    font-size:clamp(9px,calc(11px * var(--ax-scale)),12px);
+    line-height:1;
+    border-right:0;
+  }
+
+  /* v0.6.2: Premium Loadout Console — panel-size aware and overflow safe */
+  #aurelix-ui .ax-presets-shell {
+    display:grid;
+    gap:16px;
+    min-width:0;
+    container-type:inline-size;
+  }
+  #aurelix-ui .ax-preset-manager,
+  #aurelix-ui .ax-preset-manager-grid {
+    display:grid;
+    gap:16px;
+    min-width:0;
+  }
+  #aurelix-ui .ax-preset-manager-grid {
+    grid-template-columns:minmax(0,1fr);
+  }
+  #aurelix-ui .ax-preset-manager .ax-card,
+  #aurelix-ui .ax-preset-workspace {
+    min-width:0;
+    overflow:hidden;
+  }
+  #aurelix-ui .ax-preset-manager .ax-card-pad { padding:16px; }
+
+  #aurelix-ui .ax-preset-toolbar,
+  #aurelix-ui .ax-preset-createbar {
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:9px;
+    padding:12px;
+    margin-bottom:14px;
+    border:1px solid color-mix(in srgb,var(--ax-cyan) 16%,var(--ax-line));
+    border-radius:12px;
+    background:
+      linear-gradient(135deg,
+        color-mix(in srgb,var(--ax-violet) 9%,transparent),
+        color-mix(in srgb,var(--ax-cyan) 5%,transparent)),
+      rgba(0,0,0,.13);
+  }
+  #aurelix-ui .ax-preset-createbar .ax-preset-name-input {
+    flex:1 1 220px;
+    min-width:0;
+    min-height:42px;
+  }
+  #aurelix-ui .ax-preset-primary,
+  #aurelix-ui .ax-preset-secondary {
+    min-height:42px;
+    padding:0 14px;
+    border-radius:10px;
+    cursor:pointer;
+    white-space:nowrap;
+    font:800 calc(10.5px * var(--ax-scale))/1 "Inter",system-ui,sans-serif;
+    letter-spacing:.02em;
+  }
+  #aurelix-ui .ax-preset-primary {
+    border:1px solid rgba(125,211,252,.62);
+    color:#fff;
+    background:linear-gradient(135deg,#7c3aed,#2563eb 58%,#0891b2);
+    box-shadow:0 7px 18px rgba(37,99,235,.20),inset 0 1px rgba(255,255,255,.16);
+  }
+  #aurelix-ui .ax-preset-secondary {
+    border:1px solid color-mix(in srgb,var(--ax-violet) 32%,var(--ax-line));
+    color:var(--ax-text);
+    background:linear-gradient(135deg,
+      color-mix(in srgb,var(--ax-violet) 16%,var(--ax-panel-soft)),
+      color-mix(in srgb,var(--ax-cyan) 7%,var(--ax-panel-soft)));
+  }
+
+  #aurelix-ui .ax-preset-card-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(min(100%,285px),1fr));
+    gap:12px;
+    min-width:0;
+  }
+  #aurelix-ui .ax-preset-card {
+    display:flex !important;
+    flex-direction:column;
+    gap:12px;
+    min-width:0;
+    width:100%;
+    box-sizing:border-box;
+    padding:14px;
+    margin:0;
+    overflow:hidden;
+    border:1px solid var(--ax-line);
+    border-radius:13px;
+    background:
+      linear-gradient(150deg,
+        color-mix(in srgb,var(--ax-violet) 5%,var(--ax-panel-soft)),
+        color-mix(in srgb,var(--ax-panel) 94%,#000));
+    box-shadow:0 10px 24px rgba(0,0,0,.18),inset 0 1px rgba(255,255,255,.03);
+  }
+  #aurelix-ui .ax-preset-card.is-active {
+    border-color:color-mix(in srgb,var(--ax-cyan) 72%,white 6%);
+    background:
+      linear-gradient(150deg,
+        color-mix(in srgb,var(--ax-cyan) 11%,var(--ax-panel-soft)),
+        color-mix(in srgb,var(--ax-panel) 95%,#000));
+    box-shadow:0 0 0 1px color-mix(in srgb,var(--ax-cyan) 12%,transparent),
+               0 0 18px color-mix(in srgb,var(--ax-cyan) 10%,transparent),
+               0 10px 24px rgba(0,0,0,.20);
+  }
+  #aurelix-ui .ax-preset-card-top {
+    display:grid;
+    grid-template-columns:42px minmax(0,1fr) auto;
+    gap:10px;
+    align-items:center;
+    min-width:0;
+  }
+  #aurelix-ui .ax-preset-kind-icon {
+    display:grid;
+    place-items:center;
+    width:40px;
+    height:40px;
+    border-radius:11px;
+    border:1px solid color-mix(in srgb,var(--ax-cyan) 26%,var(--ax-line));
+    background:linear-gradient(145deg,
+      color-mix(in srgb,var(--ax-violet) 16%,var(--ax-panel-soft)),
+      color-mix(in srgb,var(--ax-cyan) 8%,var(--ax-panel-soft)));
+    font-size:18px;
+  }
+  #aurelix-ui .ax-preset-card-copy { min-width:0; }
+  #aurelix-ui .ax-preset-card .ax-preset-rename {
+    width:100%;
+    min-width:0;
+    min-height:38px;
+    box-sizing:border-box;
+    padding:7px 10px;
+    margin:0 0 5px;
+    border-radius:9px;
+    border:1px solid var(--ax-line);
+    background:color-mix(in srgb,var(--ax-panel) 82%,#000);
+    color:var(--ax-text);
+    font-weight:800;
+  }
+  #aurelix-ui .ax-preset-card-copy small {
+    display:block;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  #aurelix-ui .ax-active-preset-badge {
+    max-width:86px;
+    padding:6px 8px;
+    border:1px solid rgba(52,211,153,.42);
+    border-radius:999px;
+    background:rgba(16,185,129,.10);
+    color:#6ee7b7;
+    font-size:8.5px;
+    font-weight:900;
+    letter-spacing:.07em;
+    white-space:nowrap;
+  }
+
+  #aurelix-ui .ax-preset-actions {
+    display:grid !important;
+    grid-template-columns:repeat(auto-fit,minmax(82px,1fr));
+    gap:8px;
+    width:100%;
+    min-width:0;
+    padding-top:11px;
+    border-top:1px solid var(--ax-line);
+  }
+  #aurelix-ui .ax-preset-action {
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:5px;
+    min-width:0;
+    min-height:38px;
+    padding:7px 8px;
+    overflow:hidden;
+    border-radius:9px;
+    border:1px solid var(--ax-line);
+    color:var(--ax-text);
+    background:linear-gradient(145deg,var(--ax-panel-soft),var(--ax-panel));
+    white-space:nowrap;
+    font:800 calc(9.5px * var(--ax-scale))/1 "Inter",system-ui,sans-serif;
+  }
+  #aurelix-ui .ax-preset-action span { flex:0 0 auto; font-size:12px; color:var(--ax-cyan); }
+  #aurelix-ui .ax-preset-action:hover {
+    border-color:color-mix(in srgb,var(--ax-cyan) 58%,var(--ax-line));
+    background:linear-gradient(145deg,
+      color-mix(in srgb,var(--ax-cyan) 12%,var(--ax-panel-soft)),
+      var(--ax-panel));
+  }
+  #aurelix-ui .ax-preset-action.ax-equip-action {
+    color:#fff;
+    border-color:rgba(251,191,36,.42);
+    background:linear-gradient(135deg,rgba(245,158,11,.30),rgba(234,88,12,.18));
+  }
+  #aurelix-ui .ax-preset-action.danger {
+    color:#fda4af;
+    border-color:rgba(244,63,94,.25);
+    background:linear-gradient(145deg,rgba(244,63,94,.08),var(--ax-panel));
+  }
+  #aurelix-ui .ax-preset-action.danger span { color:#fb7185; }
+
+  /* One manager column at normal panel sizes; two only when there is genuinely enough room. */
+  @container (min-width:1080px) {
+    #aurelix-ui .ax-preset-manager-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  }
+  @container (max-width:640px) {
+    #aurelix-ui .ax-preset-card-grid { grid-template-columns:1fr; }
+    #aurelix-ui .ax-preset-card-top { grid-template-columns:38px minmax(0,1fr); }
+    #aurelix-ui .ax-active-preset-badge { grid-column:1 / -1; justify-self:start; }
+    #aurelix-ui .ax-preset-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  }
+
   /* Responsive */
+  @media (max-width: 480px) {
+    #aurelix-ui { padding-bottom: env(safe-area-inset-bottom, 0px); }
+    #aurelix-ui .ax-content { overflow-x:hidden; -webkit-overflow-scrolling:touch; }
+    #aurelix-ui input, #aurelix-ui select, #aurelix-ui textarea { max-width:100%; min-width:0; }
+    #aurelix-ui button { min-height:40px; }
+    #aurelix-mini { bottom:calc(14px + env(safe-area-inset-bottom, 0px)); right:14px; }
+  }
   @media (max-width: 860px) {
     #aurelix-ui { left: 0 !important; top: 0 !important; right: 0 !important; bottom: 0 !important; width: 100% !important; height: 100% !important; min-width: 0 !important; min-height: 0 !important; transform: none !important; border-radius: 0; backdrop-filter:none; contain:layout paint style; }
     #aurelix-ui .ax-header { cursor: default; }
@@ -7552,16 +8720,134 @@ async function aurelixGetUpdateStatus(force = false) {
     #aurelix-ui .ax-assignment-row { grid-template-columns: 1fr; }
     #aurelix-ui .ax-content { padding: 10px; overscroll-behavior: contain; }
     #aurelix-ui .ax-card-pad { padding: 12px; }
-    #aurelix-ui .ax-nav-btn { min-height: 52px; padding: 0 14px; }
+    #aurelix-ui .ax-nav-btn { min-height:44px; padding:0 2px; font-size:9px; }
     #aurelix-ui .ax-num, #aurelix-ui .ax-search, #aurelix-ui .ax-select, #aurelix-ui button { font-size: 16px; touch-action: manipulation; }
     #aurelix-ui .ax-pet-formation { grid-template-columns: 1fr; }
-    #aurelix-ui .ax-preset-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; }
+    #aurelix-ui .ax-preset-actions { display:grid !important; }
     #aurelix-ui .ax-theme-grid { grid-template-columns: repeat(3, 1fr); }
     #aurelix-mini { right: 20px; bottom: 20px; top: auto; transform: none; }
   }
   @media (max-width: 860px) and (prefers-reduced-motion: reduce) {
     #aurelix-ui *:not(.ax-scan-spinner), #aurelix-mini * { animation:none !important; transition:none !important; }
   }
+
+  /* Mobile responsive override: placed last to supersede desktop grid rules.
+     Coarse-pointer detection also covers mobile pages with desktop-like layout viewports. */
+  @media (max-width: 860px), (pointer: coarse) and (max-width: 1200px) {
+    #aurelix-ui {
+      position:fixed !important; inset:0 !important;
+      left:0 !important; top:0 !important; right:0 !important; bottom:0 !important;
+      width:100vw !important; height:100dvh !important;
+      max-width:100vw !important; max-height:100dvh !important;
+      min-width:0 !important; min-height:0 !important;
+      transform:none !important; border-radius:0 !important;
+      box-sizing:border-box !important;
+    }
+    #aurelix-ui, #aurelix-ui * { box-sizing:border-box; }
+    #aurelix-ui .ax-shell { min-width:0; width:100%; min-height:0; }
+    #aurelix-ui .ax-header { grid-template-columns:minmax(0,1fr) auto; padding:10px 12px; gap:8px; min-width:0; }
+    #aurelix-ui .ax-brand { min-width:0; }
+    #aurelix-ui .ax-brand-main { font-size:clamp(15px,4vw,23px); line-height:1.2; letter-spacing:.045em; overflow-wrap:anywhere; }
+    #aurelix-ui .ax-window-actions { gap:5px; }
+    #aurelix-ui .ax-window-actions button { padding:8px !important; min-width:40px; font-size:12px !important; }
+    #aurelix-ui .ax-nav {
+      display:grid !important; grid-template-columns:repeat(3,minmax(0,1fr)) !important;
+      gap:5px; padding:8px; overflow:visible !important; min-width:0;
+    }
+    #aurelix-ui .ax-nav-btn {
+      min-width:0 !important; width:100% !important; min-height:38px !important;
+      padding:5px 3px !important; font-size:clamp(10px,2.5vw,13px) !important;
+      line-height:1.25 !important; white-space:normal !important;
+      overflow-wrap:anywhere; text-align:center;
+    }
+    #aurelix-ui .ax-content { min-width:0; overflow-x:hidden !important; overflow-y:auto !important; padding:10px !important; -webkit-overflow-scrolling:touch; }
+    #aurelix-ui .ax-content > *, #aurelix-ui .ax-view, #aurelix-ui .ax-card { min-width:0; max-width:100%; }
+    #aurelix-ui .ax-premium-strip { grid-template-columns:minmax(0,1fr) !important; gap:10px; }
+    #aurelix-ui .ax-pipeline, #aurelix-ui .ax-health-console { min-width:0; width:100%; padding:12px; }
+    #aurelix-ui .ax-pipeline-track { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; padding-bottom:4px; }
+    #aurelix-ui .ax-pipe-node { flex:0 0 auto; }
+    #aurelix-ui .ax-overview, #aurelix-ui .ax-target-body { grid-template-columns:minmax(0,1fr) !important; }
+    #aurelix-ui .ax-target-body { gap:12px; padding:12px; }
+    #aurelix-ui .ax-monster-image-wrap { max-width:130px; margin:0 auto; }
+    #aurelix-ui .ax-health-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    #aurelix-ui input, #aurelix-ui select, #aurelix-ui textarea { max-width:100%; min-width:0; }
+    #aurelix-ui .ax-presets-shell, #aurelix-ui .ax-preset-manager { min-width:0; max-width:100%; }
+  }
+
+  /* Mobile Current Target: preserve desktop image-left / details-right composition. */
+  @media (max-width:860px), (pointer:coarse) and (max-width:1200px) {
+    #aurelix-ui .ax-target-body {
+      display:grid !important;
+      grid-template-columns:minmax(88px,35%) minmax(0,1fr) !important;
+      align-items:center !important;
+      gap:clamp(8px,2vw,14px) !important;
+      padding:clamp(10px,2.5vw,16px) !important;
+    }
+    #aurelix-ui .ax-monster-image-wrap {
+      width:100% !important; max-width:none !important;
+      margin:0 !important; align-self:center !important;
+    }
+    #aurelix-ui .ax-target-info {
+      min-width:0 !important; width:100% !important;
+      height:auto !important; justify-content:center !important;
+    }
+    #aurelix-ui .ax-target-name {
+      font-size:clamp(13px,3.5vw,20px) !important;
+      line-height:1.3 !important; margin-bottom:5px !important;
+      overflow-wrap:anywhere !important;
+    }
+    #aurelix-ui .ax-target-meta-grid {
+      grid-template-columns:minmax(48px,38%) minmax(0,1fr) !important;
+      gap:3px 5px !important; margin-top:4px !important;
+      font-size:clamp(9px,2.25vw,12px) !important;
+    }
+    #aurelix-ui .ax-meta-value { min-width:0 !important; overflow-wrap:anywhere !important; }
+    #aurelix-ui .ax-hp-block { margin-top:9px !important; padding-top:9px !important; min-width:0 !important; }
+    #aurelix-ui .ax-hp-block .ax-resource-label-row {
+      display:flex !important; flex-wrap:wrap !important;
+      gap:3px 5px !important; font-size:clamp(9px,2.15vw,11px) !important;
+    }
+    #aurelix-ui #ax-target-hp { overflow-wrap:anywhere !important; min-width:0 !important; }
+  }
+
+  /* Update Center refinement: isolated visual overrides, no updater logic changes. */
+  #aurelix-ui .ax-updates-view { min-width:0; }
+  #aurelix-ui .ax-updates-view .ax-card { overflow:hidden; border-radius:14px; }
+  #aurelix-ui .ax-updates-view .ax-card-head { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+  #aurelix-ui .ax-updates-view .ax-card-head h3 { font-size:13px; letter-spacing:.02em; }
+  #aurelix-ui .ax-updates-view .ax-card-pad { padding:14px; }
+  #aurelix-ui .ax-update-hero { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; padding:14px; border:1px solid var(--ax-line); border-radius:12px; background:linear-gradient(135deg,color-mix(in srgb,var(--ax-violet) 13%,var(--ax-panel-soft)),var(--ax-panel)); margin-bottom:14px; }
+  #aurelix-ui .ax-update-hero > div:first-child { flex:1 1 210px; min-width:0; }
+  #aurelix-ui .ax-update-hero-sub { max-width:560px; line-height:1.6; }
+  #aurelix-ui .ax-update-version-grid { display:grid; grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr); align-items:stretch; gap:9px; margin-bottom:13px; }
+  #aurelix-ui .ax-update-version-box { min-width:0; padding:14px; border:1px solid var(--ax-line); border-radius:12px; background:var(--ax-panel-soft); }
+  #aurelix-ui .ax-update-version { font-size:clamp(16px,3vw,22px); overflow-wrap:anywhere; }
+  #aurelix-ui .ax-update-arrow { display:grid; place-items:center; min-width:0; color:var(--ax-cyan); }
+  #aurelix-ui .ax-update-status { min-width:0; display:flex; align-items:center; gap:11px; padding:13px; border:1px solid var(--ax-line); border-radius:12px; margin-bottom:13px; background:var(--ax-panel-soft); }
+  #aurelix-ui .ax-update-status > div:last-child { min-width:0; }
+  #aurelix-ui .ax-update-status-sub { overflow-wrap:anywhere; line-height:1.55; }
+  #aurelix-ui .ax-update-actions { display:grid !important; grid-template-columns:repeat(2,minmax(0,1fr)) !important; gap:10px !important; }
+  #aurelix-ui .ax-update-actions > button { appearance:none !important; -webkit-appearance:none !important; display:flex !important; align-items:center; justify-content:center; min-width:0 !important; min-height:44px !important; padding:10px 12px !important; border:1px solid color-mix(in srgb,var(--ax-cyan) 45%,var(--ax-line)) !important; border-radius:11px !important; color:var(--ax-text) !important; background:linear-gradient(135deg,color-mix(in srgb,var(--ax-cyan) 17%,var(--ax-panel-soft)),var(--ax-panel)) !important; font:inherit; font-weight:800 !important; font-size:11px !important; line-height:1.35; text-align:center; white-space:normal; cursor:pointer; transition:filter .15s ease,border-color .15s ease; }
+  #aurelix-ui .ax-update-actions > button:hover:not(:disabled) { filter:brightness(1.15); border-color:var(--ax-cyan) !important; }
+  #aurelix-ui #ax-update-install:not(:disabled) { background:linear-gradient(135deg,#047857,#059669,#0d9488) !important; color:#f2fff9 !important; border-color:rgba(52,211,153,.55) !important; }
+  #aurelix-ui .ax-update-actions > button:disabled { opacity:.56 !important; cursor:not-allowed; filter:none; background:var(--ax-panel-soft) !important; border-color:var(--ax-line) !important; color:var(--ax-muted) !important; }
+  #aurelix-ui .ax-update-changelog { display:grid; gap:8px; min-width:0; }
+  #aurelix-ui .ax-update-change { overflow-wrap:anywhere; line-height:1.6; }
+  #aurelix-ui .ax-update-details { display:grid !important; grid-template-columns:repeat(2,minmax(0,1fr)) !important; gap:9px; }
+  #aurelix-ui .ax-update-details > div { display:flex; flex-direction:column; align-items:flex-start; justify-content:center; gap:5px; min-width:0; padding:12px; border:1px solid var(--ax-line); border-radius:11px; background:var(--ax-panel-soft); }
+  #aurelix-ui .ax-update-details strong { display:block; max-width:100%; white-space:normal; overflow-wrap:anywhere; font-size:11px; }
+  @container (max-width:470px) {
+    #aurelix-ui .ax-updates-view .ax-card-pad { padding:11px; }
+    #aurelix-ui .ax-update-hero { padding:11px; }
+    #aurelix-ui .ax-update-version-grid { grid-template-columns:minmax(0,1fr) 16px minmax(0,1fr); gap:5px; }
+    #aurelix-ui .ax-update-version-box { padding:10px 8px; }
+    #aurelix-ui .ax-update-version { font-size:15px; }
+    #aurelix-ui .ax-update-arrow { font-size:13px; }
+    #aurelix-ui .ax-update-actions { grid-template-columns:1fr !important; }
+    #aurelix-ui .ax-update-details { grid-template-columns:1fr !important; }
+  }
+  @media (prefers-reduced-motion:reduce) { #aurelix-ui .ax-update-actions > button { transition:none; } }
+
   `;
 
   const host = document.createElement('div');
@@ -7599,12 +8885,34 @@ async function aurelixGetUpdateStatus(force = false) {
   <button class="ax-nav-btn" data-view="resources">🧪 Resources</button>
   <button class="ax-nav-btn" data-view="targets">🎯 Targets</button>
   <button class="ax-nav-btn" data-view="presets">🎒 Presets</button>
+  <button class="ax-nav-btn" data-view="assignments">🧭 Assignments</button>
   <button class="ax-nav-btn" data-view="settings">🛠️ Settings</button>
   <button class="ax-nav-btn" data-view="updates">🚀 Updates</button>
   <button class="ax-nav-btn" data-view="logs">📟 Logs</button>
 </nav>
       <main class="ax-content">
         <section class="ax-view active" data-view="overview">
+          <div class="ax-premium-strip">
+            <div class="ax-pipeline">
+              <div class="ax-console-label">Live Engine Pipeline</div>
+              <div class="ax-pipeline-track" id="ax-pipeline-track">
+                <span class="ax-pipe-node" data-pipe="scan">SCAN</span><span class="ax-pipe-arrow">›</span>
+                <span class="ax-pipe-node" data-pipe="decide">DECIDE</span><span class="ax-pipe-arrow">›</span>
+                <span class="ax-pipe-node" data-pipe="loadout">LOADOUT</span><span class="ax-pipe-arrow">›</span>
+                <span class="ax-pipe-node" data-pipe="resource">RESOURCE</span><span class="ax-pipe-arrow">›</span>
+                <span class="ax-pipe-node" data-pipe="attack">ATTACK</span><span class="ax-pipe-arrow">›</span>
+                <span class="ax-pipe-node" data-pipe="verify">VERIFY</span>
+              </div>
+            </div>
+            <div class="ax-health-console">
+              <div class="ax-console-label">Engine Health</div>
+              <div class="ax-health-grid">
+                <div class="ax-health-stat"><span>Network</span><strong id="ax-health-network">—</strong></div>
+                <div class="ax-health-stat"><span>Decision</span><strong id="ax-health-decision">—</strong></div>
+                <div class="ax-health-stat"><span>Queue</span><strong id="ax-health-queue">—</strong></div>
+              </div>
+            </div>
+          </div>
           <div class="ax-overview">
             <div>
               <article class="ax-card">
@@ -7782,57 +9090,64 @@ async function aurelixGetUpdateStatus(force = false) {
         </section>
         <section class="ax-view" data-view="presets">
           <div class="ax-presets-shell">
-            <div class="ax-preset-nav">
-              <button class="ax-choice-btn active" data-preset-subview="manager" type="button">🎒 Preset Manager</button>
-              <button class="ax-choice-btn" data-preset-subview="assignments" type="button">🎯 Monster Assignments</button>
-            </div>
-            <div class="ax-preset-subview active ax-preset-manager" data-preset-panel="manager">
+            <div class="ax-preset-manager">
             <article class="ax-card">
               <div class="ax-card-head"><h3>🛠️ Loadout Controller</h3></div>
               <div class="ax-card-pad">
                 <div class="ax-preset-toolbar">
-                  <button class="ax-mini-action" id="ax-sync-presets" type="button">↻ Import Existing Presets</button>
-                  <button class="ax-mini-action" id="ax-detect-loadout" type="button">🔍 Detect Equipped</button>
+                  <button class="ax-preset-secondary" id="ax-sync-presets" type="button">↻ Import Existing Presets</button>
+                  <button class="ax-preset-secondary" id="ax-detect-loadout" type="button">⌁ Detect Equipped Loadout</button>
                   <span id="ax-loadout-status" style="margin-left:auto; color:var(--ax-muted); font-size:12px;">Preset controller ready</span>
                 </div>
               </div>
             </article>
-            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; margin-top:16px;">
-              <article class="ax-card">
+            <div class="ax-preset-manager-grid">
+              <article class="ax-card ax-preset-workspace ax-equipment-workspace">
                 <div class="ax-card-head"><h3>⚔️ Equipment + Crystals</h3></div>
                 <div class="ax-card-pad">
-                  <div class="ax-preset-toolbar" style="margin-bottom:16px">
+                  <div class="ax-preset-createbar">
                     <input class="ax-search ax-preset-name-input" id="ax-equipment-preset-name" maxlength="40" placeholder="New equipment preset name">
-                    <button class="ax-mini-action" id="ax-save-equipment-preset" type="button">➕ Save Equipped</button>
+                    <button class="ax-preset-primary" id="ax-save-equipment-preset" type="button"><span>＋</span> Save Equipped Loadout</button>
                   </div>
-                  <div id="ax-equipment-presets"></div>
+                  <div class="ax-preset-card-grid" id="ax-equipment-presets"></div>
                 </div>
               </article>
-              <article class="ax-card">
+              <article class="ax-card ax-preset-workspace ax-pet-workspace">
                 <div class="ax-card-head"><h3>🐾 Pet Formation</h3></div>
                 <div class="ax-card-pad">
-                  <div class="ax-preset-toolbar" style="margin-bottom:16px">
-                    <button class="ax-mini-action" id="ax-new-pet-preset" type="button">➕ Create Preset</button>
+                  <div class="ax-preset-createbar ax-pet-createbar">
+                    <button class="ax-preset-primary" id="ax-new-pet-preset" type="button"><span>＋</span> Build Formation</button>
                     <input class="ax-search ax-preset-name-input" id="ax-pet-preset-name" maxlength="40" placeholder="Equipped preset name">
-                    <button class="ax-mini-action" id="ax-save-pet-preset" type="button">➕ Save Equipped</button>
+                    <button class="ax-preset-secondary" id="ax-save-pet-preset" type="button">⬇ Save Equipped Formation</button>
                   </div>
-                  <div id="ax-pet-presets"></div>
+                  <div class="ax-preset-card-grid" id="ax-pet-presets"></div>
                 </div>
               </article>
             </div>
             <article class="ax-card" id="ax-pet-builder-card" style="display:none; margin-top:16px;">
               <div class="ax-card-head"><h3>🐾 Pet Formation Builder</h3><span id="ax-pet-builder-mode" style="color:var(--ax-muted); font-size:12px;">NEW</span></div>
               <div class="ax-card-pad ax-pet-builder">
-                <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:16px;">
+                <div class="ax-pet-builder-toolbar">
                   <input class="ax-search ax-preset-name-input" id="ax-pet-builder-name" maxlength="40" placeholder="Pet preset name">
-                  <button class="ax-mini-action" id="ax-pet-builder-cancel" type="button">❌ Cancel</button>
-                  <button class="ax-mini-action" id="ax-pet-builder-save" type="button" style="color:var(--ax-green); border-color:var(--ax-green);">✅ Save Formation</button>
+                  <button class="ax-preset-secondary" id="ax-pet-builder-cancel" type="button">✕ Cancel</button>
+                  <button class="ax-preset-primary" id="ax-pet-builder-save" type="button">✓ Save Formation</button>
                 </div>
                 <div class="ax-pet-formation" id="ax-pet-formation"></div>
               </div>
             </article>
             </div>
-            <div class="ax-preset-subview ax-preset-assignments" data-preset-panel="assignments">
+            <div class="ax-pet-picker" id="ax-pet-picker">
+              <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+                <strong id="ax-pet-picker-title">Select Pet</strong>
+                <input class="ax-search ax-preset-name-input" id="ax-pet-picker-search" placeholder="🔍 Search pet name or ID">
+                <button class="ax-mini-action" id="ax-pet-picker-close" type="button" style="margin-left:auto;">❌ Close</button>
+              </div>
+              <div class="ax-pet-picker-grid" id="ax-pet-picker-grid"></div>
+            </div>
+          </div>
+        </section>
+        <section class="ax-view" data-view="assignments">
+          <div class="ax-preset-assignments">
             <article class="ax-card">
               <div class="ax-card-head"><h3>🎯 Monster Assignments</h3></div>
               <div class="ax-card-pad">
@@ -7850,18 +9165,20 @@ async function aurelixGetUpdateStatus(force = false) {
               </div>
             </article>
             </div>
-            <div class="ax-pet-picker" id="ax-pet-picker">
-              <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
-                <strong id="ax-pet-picker-title">Select Pet</strong>
-                <input class="ax-search ax-preset-name-input" id="ax-pet-picker-search" placeholder="🔍 Search pet name or ID">
-                <button class="ax-mini-action" id="ax-pet-picker-close" type="button" style="margin-left:auto;">❌ Close</button>
-              </div>
-              <div class="ax-pet-picker-grid" id="ax-pet-picker-grid"></div>
-            </div>
-          </div>
         </section>
         <section class="ax-view" data-view="settings">
           <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px;">
+            <article class="ax-card">
+              <div class="ax-card-head"><h3>⚡ Performance Core</h3></div>
+              <div class="ax-card-pad">
+                <div class="ax-setting-copy"><strong>Execution Profile</strong><small>ECO reduces background concurrency. BALANCED is recommended. TURBO raises safe read concurrency without bypassing combat verification.</small></div>
+                <div class="ax-mode-switch" id="ax-performance-modes">
+                  <button class="ax-mode-btn" data-performance-mode="eco">ECO</button>
+                  <button class="ax-mode-btn active" data-performance-mode="balanced">BALANCED</button>
+                  <button class="ax-mode-btn" data-performance-mode="turbo">TURBO</button>
+                </div>
+              </div>
+            </article>
             <article class="ax-card">
               <div class="ax-card-head"><h3>📐 Panel Size</h3></div>
               <div class="ax-card-pad">
@@ -7911,150 +9228,100 @@ async function aurelixGetUpdateStatus(force = false) {
                 </div>
               </div>
             </article>
+            <article class="ax-card" style="grid-column:1/-1">
+              <div class="ax-card-head"><div><h3>🩺 Engine Diagnostics</h3><div class="ax-card-sub">Read-only system snapshot for troubleshooting scanner, combat, phases, loadouts, skills and errors.</div></div><span class="ax-badge">LOCAL ONLY</span></div>
+              <div class="ax-card-pad" style="display:grid;gap:12px">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,145px),1fr));gap:10px">
+                  <button type="button" class="ax-save-btn" id="ax-diag-capture">📋 Capture Report</button>
+                  <button type="button" class="ax-save-btn" id="ax-diag-copy">📑 Copy Report</button>
+                  <button type="button" class="ax-save-btn" id="ax-diag-download">⬇ Save JSON</button>
+                  <button type="button" class="ax-save-btn" id="ax-diag-share">↗ Share Report</button>
+                </div>
+                <div class="ax-setting-copy"><small>No combat, scans, requests or preset changes are triggered. The report is generated only when requested. Review before sharing; monster names and your configuration may be included. Authentication tokens and raw HTML are not collected.</small></div>
+                <div id="ax-diag-status" role="status" style="color:var(--ax-muted);font-size:12px">Ready. Capture a snapshot after the problem occurs.</div>
+                <textarea id="ax-diag-output" readonly spellcheck="false" placeholder="Diagnostic JSON will appear here" style="width:100%;box-sizing:border-box;min-height:180px;max-height:340px;resize:vertical;-webkit-user-select:text;user-select:text;touch-action:pan-y;background:rgba(4,9,20,.72);color:var(--ax-text);border:1px solid var(--ax-border);border-radius:10px;padding:12px;font:11px/1.5 monospace"></textarea>
+              </div>
+            </article>
           </div>
         </section>
         <section class="ax-view ax-updates-view" data-view="updates">
+          <div class="ax-card ax-update-main-card">
+            <div class="ax-card-head">
+              <div>
+                <h3>🚀 AURELIX Update Center</h3>
+                <div class="ax-card-sub">Verify, review and install official stable releases.</div>
+              </div>
+              <div class="ax-badge" id="ax-update-badge">NOT CHECKED</div>
+            </div>
+            <div class="ax-card-pad">
+              <div class="ax-update-hero">
+                <div>
+                  <div class="ax-update-hero-title"><span class="ax-update-hero-icon">🛰️</span><span>Release Control</span></div>
+                  <div class="ax-update-hero-sub">Checks the official AURELIX GitHub release manifest and only enables installation after a newer trusted version is verified.</div>
+                </div>
+                <div class="ax-badge">🛡️ TRUSTED CHANNEL</div>
+              </div>
 
-  <div class="ax-card ax-update-main-card">
-    <div class="ax-card-head">
-      <div>
-        <div class="ax-card-title">🚀 AURELIX Update Center</div>
-        <div class="ax-card-sub">
-          Check for new AURELIX releases and install updates.
-        </div>
-      </div>
+              <div class="ax-update-version-grid">
+                <div class="ax-update-version-box">
+                  <div class="ax-update-version-icon">🧩</div>
+                  <div class="ax-update-label">Installed Version</div>
+                  <div class="ax-update-version" id="ax-update-current">—</div>
+                </div>
+                <div class="ax-update-arrow">➜</div>
+                <div class="ax-update-version-box">
+                  <div class="ax-update-version-icon">✨</div>
+                  <div class="ax-update-label">Latest Version</div>
+                  <div class="ax-update-version" id="ax-update-latest">—</div>
+                </div>
+              </div>
 
-      <div class="ax-badge" id="ax-update-badge">
-        NOT CHECKED
-      </div>
-    </div>
+              <div class="ax-update-status" id="ax-update-status">
+                <div class="ax-update-status-icon">⏺️</div>
+                <div>
+                  <div class="ax-update-status-title">Update status not checked</div>
+                  <div class="ax-update-status-sub">Check the official release channel for the newest stable build.</div>
+                </div>
+              </div>
 
-    <div class="ax-card-pad">
-
-      <div class="ax-update-version-grid">
-
-        <div class="ax-update-version-box">
-          <div class="ax-update-label">
-            INSTALLED VERSION
+              <div class="ax-update-actions">
+                <button class="ax-btn" id="ax-update-check" type="button">🔎 Check for Update</button>
+                <button class="ax-btn" id="ax-update-install" type="button" disabled>🛡️ Verify & Install</button>
+              </div>
+            </div>
           </div>
 
-          <div class="ax-update-version" id="ax-update-current">
-            —
-          </div>
-        </div>
-
-        <div class="ax-update-arrow">
-          →
-        </div>
-
-        <div class="ax-update-version-box">
-          <div class="ax-update-label">
-            LATEST VERSION
-          </div>
-
-          <div class="ax-update-version" id="ax-update-latest">
-            —
-          </div>
-        </div>
-
-      </div>
-
-      <div class="ax-update-status" id="ax-update-status">
-        <div class="ax-update-status-icon">◌</div>
-
-        <div>
-          <div class="ax-update-status-title">
-            Update status not checked
+          <div class="ax-card ax-update-release-card" style="margin-top:12px;">
+            <div class="ax-card-head">
+              <div>
+                <h3>📋 What’s New</h3>
+                <div class="ax-card-sub" id="ax-update-release-info">Release information will appear after checking for updates.</div>
+              </div>
+            </div>
+            <div class="ax-card-pad">
+              <div class="ax-update-changelog" id="ax-update-changelog">
+                <div class="ax-update-empty">✨ No release information loaded yet.</div>
+              </div>
+            </div>
           </div>
 
-          <div class="ax-update-status-sub">
-            Check GitHub for the latest stable AURELIX release.
+          <div class="ax-card ax-update-channel-card" style="margin-top:12px;">
+            <div class="ax-card-head">
+              <div>
+                <h3>📡 Release Channel</h3>
+                <div class="ax-card-sub">Official AURELIX production update source.</div>
+              </div>
+            </div>
+            <div class="ax-card-pad">
+              <div class="ax-update-details">
+                <div><span>📡 Channel</span><strong id="ax-update-channel">Stable</strong></div>
+                <div><span>🛰️ Source</span><strong>GitHub / cosmic451 / AURELIX</strong></div>
+                <div><span>🕒 Last Checked</span><strong id="ax-update-checked">Never</strong></div>
+                <div><span>🛡️ Install Policy</span><strong>Verified newer version only</strong></div>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
-
-      <div class="ax-update-actions">
-
-        <button
-          type="button"
-          class="ax-btn"
-          id="ax-update-check"
-        >
-          🔍 Check Update
-        </button>
-
-        <button
-          type="button"
-          class="ax-btn"
-          id="ax-update-install"
-          disabled
-        >
-          🚀 Install Update
-        </button>
-
-      </div>
-
-    </div>
-  </div>
-
-  <div class="ax-card ax-update-release-card">
-    <div class="ax-card-head">
-      <div>
-        <div class="ax-card-title">📋 What's New</div>
-        <div class="ax-card-sub" id="ax-update-release-info">
-          Release information will appear after checking for updates.
-        </div>
-      </div>
-    </div>
-
-    <div class="ax-card-pad">
-
-      <div
-        class="ax-update-changelog"
-        id="ax-update-changelog"
-      >
-        <div class="ax-update-empty">
-          No release information loaded.
-        </div>
-      </div>
-
-    </div>
-  </div>
-
-  <div class="ax-card ax-update-channel-card">
-    <div class="ax-card-head">
-      <div>
-        <div class="ax-card-title">⚡ Release Channel</div>
-        <div class="ax-card-sub">
-          AURELIX production update source
-        </div>
-      </div>
-    </div>
-
-    <div class="ax-card-pad">
-
-      <div class="ax-update-details">
-
-        <div>
-          <span>Channel</span>
-          <strong id="ax-update-channel">Stable</strong>
-        </div>
-
-        <div>
-          <span>Last Checked</span>
-          <strong id="ax-update-checked">Never</strong>
-        </div>
-
-        <div>
-          <span>Author</span>
-          <strong>Cosmic</strong>
-        </div>
-
-      </div>
-
-    </div>
-  </div>
-   </section>
+        </section>
         <section class="ax-view" data-view="logs">
           <div class="ax-card">
             <div class="ax-card-head"><h3>📟 Activity Logs</h3></div>
@@ -8067,249 +9334,434 @@ async function aurelixGetUpdateStatus(force = false) {
         <span id="ax-footer-right">Scanner: waiting</span>
       </footer>
     </div>
-/* Preset workspace refinement — layout only; existing preset logic/hooks unchanged. */
-#aurelix-ui .ax-presets-shell { display:grid; gap:18px; }
-#aurelix-ui .ax-preset-nav { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; padding:0; border:0; border-radius:0; background:transparent; width:100%; }
-#aurelix-ui .ax-preset-nav .ax-choice-btn { width:100%; min-width:0; min-height:42px; padding:10px 16px; border:1px solid var(--ax-line); border-radius:6px; background:rgba(0,0,0,.2); color:var(--ax-muted); }
-#aurelix-ui .ax-preset-nav .ax-choice-btn.active { background:rgba(255,255,255,.08); border-color:var(--ax-cyan); color:var(--ax-cyan); box-shadow:none; }
-#aurelix-ui .ax-preset-subview { display:none; }
-#aurelix-ui .ax-preset-subview.active { display:grid; gap:18px; }
-#aurelix-ui .ax-preset-manager > .ax-card:first-child { margin-bottom:0; }
-#aurelix-ui .ax-preset-manager > div[style*="grid-template-columns"] { gap:16px !important; margin-top:0 !important; }
-#aurelix-ui .ax-preset-manager .ax-card-pad, #aurelix-ui .ax-preset-assignments .ax-card-pad { padding:16px; }
-#aurelix-ui .ax-preset-toolbar { gap:10px; margin-bottom:14px; }
-#aurelix-ui .ax-preset-toolbar .ax-search { min-width:190px; }
-#aurelix-ui .ax-preset-card { grid-template-columns:minmax(0,1fr); gap:10px; padding:12px 13px; margin-bottom:10px; border-radius:9px; }
-#aurelix-ui .ax-preset-card.is-active { border-width:1px; box-shadow:0 0 0 1px var(--ax-cyan),0 0 12px color-mix(in srgb,var(--ax-cyan) 24%,transparent); }
-#aurelix-ui .ax-preset-card .ax-preset-rename { min-height:36px; padding:7px 9px; }
-#aurelix-ui .ax-preset-card small { color:var(--ax-muted); font-size:calc(10.5px * var(--ax-scale)); }
-#aurelix-ui .ax-preset-actions { display:flex; flex-wrap:wrap; justify-content:flex-start; gap:6px; padding-top:8px; border-top:1px solid rgba(255,255,255,.055); }
-#aurelix-ui .ax-preset-actions .ax-mini-action { min-width:36px; min-height:34px; padding:6px 9px; }
-#aurelix-ui .ax-preset-assignments .ax-card { border-color:color-mix(in srgb,var(--ax-cyan) 20%,var(--ax-line)); }
-#aurelix-ui .ax-preset-assignments #ax-loadout-assignments { margin-top:14px; }
-#aurelix-ui .ax-preset-assignments .ax-assignment-row { margin-bottom:10px; padding:13px; }
-@media (max-width:760px){
-  #aurelix-ui .ax-preset-manager > div[style*="grid-template-columns"] { grid-template-columns:1fr !important; }
-  #aurelix-ui .ax-preset-nav { grid-template-columns:1fr 1fr; }
-}
-
-/* Update workspace refinement — status/update logic unchanged. */
-#aurelix-ui .ax-updates-view { display:none; gap:14px; }
-#aurelix-ui .ax-updates-view.active { display:grid; }
-#aurelix-ui .ax-updates-view .ax-card { margin:0; }
-#aurelix-ui .ax-update-main-card .ax-card-pad { display:grid; grid-template-columns:minmax(0,1fr) minmax(240px,.72fr); gap:12px 16px; align-items:stretch; }
-#aurelix-ui .ax-update-main-card .ax-update-version-grid { grid-column:1; grid-row:1; margin:0; }
-#aurelix-ui .ax-update-main-card .ax-update-status { grid-column:2; grid-row:1; margin:0; }
-#aurelix-ui .ax-update-main-card .ax-update-actions { grid-column:1/-1; grid-row:2; }
-#aurelix-ui .ax-update-version-grid { grid-template-columns:1fr auto 1fr; gap:8px; }
-#aurelix-ui .ax-update-version-box { padding:11px 12px; border-radius:9px; border-color:var(--ax-line); background:rgba(255,255,255,.018); }
-#aurelix-ui .ax-update-label { margin-bottom:4px; font-size:9px; letter-spacing:.8px; }
-#aurelix-ui .ax-update-version { font-size:17px; }
-#aurelix-ui .ax-update-arrow { font-size:16px; }
-#aurelix-ui .ax-update-status { min-height:100%; padding:11px 12px; border-radius:9px; border-color:var(--ax-line); background:rgba(255,255,255,.018); }
-#aurelix-ui .ax-update-status-icon { width:30px; height:30px; flex-basis:30px; border-radius:8px; font-size:15px; }
-#aurelix-ui .ax-update-status-title { font-size:11px; }
-#aurelix-ui .ax-update-status-sub { font-size:10px; }
-#aurelix-ui .ax-update-actions { gap:8px; }
-#aurelix-ui .ax-update-actions .ax-btn { flex:0 1 auto; min-width:150px; }
-#aurelix-ui .ax-update-release-card .ax-card-pad { padding-top:12px; }
-#aurelix-ui .ax-update-changelog { gap:6px; }
-#aurelix-ui .ax-update-change { padding:8px 10px 8px 27px; border-radius:8px; }
-#aurelix-ui .ax-update-change::before { left:9px; top:8px; }
-#aurelix-ui .ax-update-channel-card .ax-card-pad { padding:10px 14px 14px; }
-#aurelix-ui .ax-update-details { grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
-#aurelix-ui .ax-update-details > div { display:grid; gap:3px; align-content:center; padding:9px 10px; border-radius:8px; }
-#aurelix-ui .ax-update-details span, #aurelix-ui .ax-update-details strong { display:block; }
-@media (max-width:760px){
-  #aurelix-ui .ax-update-main-card .ax-card-pad { grid-template-columns:1fr; }
-  #aurelix-ui .ax-update-main-card .ax-update-version-grid, #aurelix-ui .ax-update-main-card .ax-update-status, #aurelix-ui .ax-update-main-card .ax-update-actions { grid-column:1; grid-row:auto; }
-  #aurelix-ui .ax-update-details { grid-template-columns:1fr; }
-}
-
 /* =========================================================
-   AURELIX UPDATE CENTER
+   AURELIX UPDATE CENTER — v0.6.2 premium release console
    ========================================================= */
 
-.ax-update-version-grid {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 16px;
-}
+.ax-updates-view { min-width:0; }
+.ax-update-main-card,
+.ax-update-release-card,
+.ax-update-channel-card { overflow:hidden; }
 
-.ax-update-version-box {
-  padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
+.ax-update-hero {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  gap:14px;
+  align-items:center;
+  margin-bottom:15px;
+  padding:14px;
+  border:1px solid color-mix(in srgb,var(--ax-cyan) 18%,var(--ax-line));
+  border-radius:13px;
   background:
-    linear-gradient(
-      145deg,
-      rgba(255,255,255,.035),
-      rgba(255,255,255,.012)
-    );
-  text-align: center;
+    radial-gradient(circle at 0 0,color-mix(in srgb,var(--ax-violet) 12%,transparent),transparent 42%),
+    linear-gradient(135deg,color-mix(in srgb,var(--ax-panel-soft) 94%,#000),var(--ax-panel));
 }
+.ax-update-hero-title {
+  display:flex;
+  align-items:center;
+  gap:9px;
+  font-size:13px;
+  font-weight:900;
+  color:var(--ax-text);
+}
+.ax-update-hero-title .ax-update-hero-icon {
+  display:grid;
+  place-items:center;
+  width:34px;
+  height:34px;
+  border-radius:10px;
+  border:1px solid color-mix(in srgb,var(--ax-cyan) 35%,var(--ax-line));
+  background:color-mix(in srgb,var(--ax-cyan) 9%,var(--ax-panel-soft));
+}
+.ax-update-hero-sub { margin-top:4px; font-size:10px; color:var(--ax-muted); line-height:1.45; }
 
+.ax-update-version-grid {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
+  align-items:stretch;
+  gap:10px;
+  margin-bottom:14px;
+}
+.ax-update-version-box {
+  min-width:0;
+  padding:14px;
+  border:1px solid var(--ax-line);
+  border-radius:12px;
+  background:linear-gradient(145deg,var(--ax-panel-soft),color-mix(in srgb,var(--ax-panel) 94%,#000));
+}
+.ax-update-version-box .ax-update-version-icon {
+  margin-bottom:7px;
+  font-size:17px;
+}
 .ax-update-label {
-  margin-bottom: 7px;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 1.2px;
-  opacity: .58;
+  margin-bottom:6px;
+  font-size:9px;
+  font-weight:850;
+  letter-spacing:.09em;
+  text-transform:uppercase;
+  color:var(--ax-muted);
 }
-
 .ax-update-version {
-  font-size: 22px;
-  font-weight: 900;
-  letter-spacing: .4px;
+  font-size:21px;
+  font-weight:900;
+  letter-spacing:.03em;
+  color:var(--ax-text);
 }
-
 .ax-update-arrow {
-  font-size: 22px;
-  font-weight: 900;
-  opacity: .42;
+  display:grid;
+  place-items:center;
+  min-width:32px;
+  font-size:20px;
+  font-weight:900;
+  color:var(--ax-cyan);
+  opacity:.75;
 }
 
 .ax-update-status {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-
-  padding: 13px 14px;
-  margin-bottom: 14px;
-
-  border: 1px solid var(--line);
-  border-radius: 13px;
-
-  background: rgba(255,255,255,.025);
+  display:flex;
+  align-items:center;
+  gap:11px;
+  min-width:0;
+  padding:12px 13px;
+  margin-bottom:13px;
+  border:1px solid var(--ax-line);
+  border-radius:12px;
+  background:color-mix(in srgb,var(--ax-panel-soft) 78%,transparent);
 }
-
 .ax-update-status-icon {
-  display: grid;
-  place-items: center;
-
-  width: 34px;
-  height: 34px;
-
-  flex: 0 0 34px;
-
-  border-radius: 10px;
-  border: 1px solid var(--line);
-
-  font-size: 18px;
-  font-weight: 900;
+  display:grid;
+  place-items:center;
+  width:34px;
+  height:34px;
+  flex:0 0 34px;
+  border-radius:10px;
+  border:1px solid color-mix(in srgb,var(--ax-cyan) 24%,var(--ax-line));
+  background:color-mix(in srgb,var(--ax-cyan) 6%,var(--ax-panel));
+  font-size:17px;
+  font-weight:900;
 }
-
-.ax-update-status-title {
-  font-size: 12px;
-  font-weight: 900;
-}
-
-.ax-update-status-sub {
-  margin-top: 3px;
-  font-size: 10px;
-  line-height: 1.45;
-  opacity: .58;
-}
+.ax-update-status-title { font-size:11px; font-weight:900; color:var(--ax-text); }
+.ax-update-status-sub { margin-top:3px; font-size:9.5px; line-height:1.45; color:var(--ax-muted); }
 
 .ax-update-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 9px;
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:9px;
 }
-
 .ax-update-actions .ax-btn {
-  flex: 1 1 160px;
+  min-width:0;
+  min-height:42px;
+  border-radius:10px;
+  font-weight:850;
 }
-
+#ax-update-check {
+  border-color:color-mix(in srgb,var(--ax-cyan) 38%,var(--ax-line));
+  background:linear-gradient(135deg,color-mix(in srgb,var(--ax-cyan) 11%,var(--ax-panel-soft)),var(--ax-panel));
+}
+#ax-update-install:not(:disabled) {
+  color:#fff;
+  border-color:rgba(52,211,153,.5);
+  background:linear-gradient(135deg,#059669,#0d9488 58%,#0891b2);
+  box-shadow:0 8px 20px rgba(5,150,105,.18);
+}
 .ax-update-actions .ax-btn:disabled {
-  opacity: .38;
-  cursor: not-allowed;
-  filter: grayscale(.35);
+  opacity:.38;
+  cursor:not-allowed;
+  filter:saturate(.5);
+  box-shadow:none !important;
 }
 
-.ax-update-changelog {
-  display: grid;
-  gap: 8px;
-}
-
+.ax-update-changelog { display:grid; gap:8px; }
 .ax-update-change {
-  position: relative;
-
-  padding: 10px 12px 10px 30px;
-
-  border: 1px solid var(--line);
-  border-radius: 11px;
-
-  background: rgba(255,255,255,.02);
-
-  font-size: 11px;
-  line-height: 1.5;
+  position:relative;
+  padding:10px 12px 10px 31px;
+  border:1px solid var(--ax-line);
+  border-radius:10px;
+  background:color-mix(in srgb,var(--ax-panel-soft) 65%,transparent);
+  font-size:10.5px;
+  line-height:1.5;
 }
-
 .ax-update-change::before {
-  content: "✦";
-
-  position: absolute;
-  left: 11px;
-  top: 10px;
-
-  font-size: 10px;
-  opacity: .7;
+  content:"✨";
+  position:absolute;
+  left:9px;
+  top:9px;
+  font-size:11px;
 }
-
 .ax-update-empty {
-  padding: 14px;
-
-  border: 1px dashed var(--line);
-  border-radius: 11px;
-
-  text-align: center;
-
-  font-size: 11px;
-  opacity: .5;
+  padding:14px;
+  border:1px dashed var(--ax-line);
+  border-radius:10px;
+  text-align:center;
+  font-size:10.5px;
+  color:var(--ax-muted);
 }
-
-.ax-update-details {
-  display: grid;
-  gap: 8px;
-}
-
+.ax-update-details { display:grid; gap:8px; }
 .ax-update-details > div {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 15px;
-
-  padding: 10px 12px;
-
-  border: 1px solid var(--line);
-  border-radius: 10px;
-
-  background: rgba(255,255,255,.018);
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:center;
+  gap:12px;
+  min-width:0;
+  padding:10px 11px;
+  border:1px solid var(--ax-line);
+  border-radius:10px;
+  background:color-mix(in srgb,var(--ax-panel-soft) 55%,transparent);
 }
-
-.ax-update-details span {
-  font-size: 10px;
-  opacity: .58;
-}
-
+.ax-update-details span { min-width:0; font-size:9.5px; color:var(--ax-muted); }
 .ax-update-details strong {
-  font-size: 11px;
-  font-weight: 850;
+  max-width:260px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-size:10.5px;
+  font-weight:850;
+  color:var(--ax-text);
 }
 
-@media (max-width: 620px) {
-  .ax-update-version-grid {
-    grid-template-columns: 1fr;
+@media (max-width:620px) {
+  .ax-update-hero { grid-template-columns:1fr; }
+  .ax-update-version-grid { grid-template-columns:1fr; }
+  .ax-update-arrow { transform:rotate(90deg); min-height:22px; }
+  .ax-update-actions { grid-template-columns:1fr; }
+}
+
+  /* =========================================================
+     v0.6.3 FINAL LAYOUT GUARD
+     These rules intentionally come last.
+     ========================================================= */
+
+  /* All nine section names always remain in ONE horizontal row. */
+  #aurelix-ui .ax-nav {
+    display:grid !important;
+    grid-template-columns:repeat(9,minmax(0,1fr)) !important;
+    grid-auto-flow:column !important;
+    gap:3px !important;
+    padding:6px 7px !important;
+    overflow:hidden !important;
+    flex-wrap:nowrap !important;
   }
 
-  .ax-update-arrow {
-    transform: rotate(90deg);
-    text-align: center;
+  #aurelix-ui .ax-nav-btn {
+    box-sizing:border-box !important;
+    min-width:0 !important;
+    width:100% !important;
+    min-height:42px !important;
+    padding:0 2px !important;
+    white-space:nowrap !important;
+    overflow:hidden !important;
+    text-overflow:clip !important;
+    font-size:clamp(7.5px,1.05cqw,10.5px) !important;
+    line-height:1 !important;
+    letter-spacing:-.025em !important;
   }
-}
+
+  /* Loadout workspaces remain full-width until the panel is genuinely very wide. */
+  #aurelix-ui .ax-presets-shell { container-type:inline-size !important; }
+  #aurelix-ui .ax-preset-manager-grid {
+    grid-template-columns:minmax(0,1fr) !important;
+  }
+
+  @container (min-width:1180px) {
+    #aurelix-ui .ax-preset-manager-grid {
+      grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+    }
+  }
+
+  #aurelix-ui .ax-preset-card-grid {
+    grid-template-columns:repeat(auto-fit,minmax(min(100%,270px),1fr)) !important;
+  }
+
+  #aurelix-ui .ax-preset-card {
+    min-width:0 !important;
+    overflow:hidden !important;
+  }
+
+  #aurelix-ui .ax-preset-actions {
+    grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+    width:100% !important;
+    min-width:0 !important;
+  }
+
+  #aurelix-ui .ax-preset-action {
+    box-sizing:border-box !important;
+    width:100% !important;
+    min-width:0 !important;
+    max-width:100% !important;
+  }
+
+  @container (min-width:560px) {
+    #aurelix-ui .ax-preset-card[data-preset-kind="equipment"] .ax-preset-actions {
+      grid-template-columns:repeat(4,minmax(0,1fr)) !important;
+    }
+    #aurelix-ui .ax-preset-card[data-preset-kind="pet"] .ax-preset-actions {
+      grid-template-columns:repeat(3,minmax(0,1fr)) !important;
+    }
+  }
+
+  /* Update Center remains compact and attractive as panel width changes. */
+  #aurelix-ui .ax-update-main-card,
+  #aurelix-ui .ax-update-release-card,
+  #aurelix-ui .ax-update-channel-card {
+    overflow:hidden;
+  }
+
+  #aurelix-ui .ax-update-actions {
+    display:grid !important;
+    grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+    gap:9px !important;
+  }
+
+  #aurelix-ui #ax-update-check {
+    border-color:color-mix(in srgb,var(--ax-cyan) 42%,var(--ax-line)) !important;
+    background:linear-gradient(135deg,
+      color-mix(in srgb,var(--ax-cyan) 17%,var(--ax-panel-soft)),
+      color-mix(in srgb,var(--ax-blue) 12%,var(--ax-panel))) !important;
+  }
+
+  #aurelix-ui #ax-update-install:not(:disabled) {
+    color:#f0fff8 !important;
+    border-color:rgba(52,211,153,.48) !important;
+    background:linear-gradient(135deg,rgba(16,185,129,.28),rgba(5,150,105,.16)) !important;
+    box-shadow:0 7px 18px rgba(16,185,129,.12) !important;
+  }
+
+  #aurelix-ui .ax-update-details {
+    grid-template-columns:repeat(3,minmax(0,1fr)) !important;
+  }
+
+  @media (max-width:620px) {
+    #aurelix-ui .ax-update-actions,
+    #aurelix-ui .ax-update-details {
+      grid-template-columns:1fr !important;
+    }
+  }
+
+  /* =========================================================
+     v0.6.4 — FINAL CONTROL + THEME POLISH
+     ========================================================= */
+
+  /* Update Center buttons: never fall back to browser-white controls. */
+  #aurelix-ui .ax-update-actions > button,
+  #aurelix-ui #ax-update-check,
+  #aurelix-ui #ax-update-install {
+    appearance:none !important;
+    -webkit-appearance:none !important;
+    box-sizing:border-box !important;
+    min-height:42px !important;
+    padding:0 14px !important;
+    border-radius:10px !important;
+    border:1px solid color-mix(in srgb,var(--ax-cyan) 42%,var(--ax-line)) !important;
+    color:var(--ax-text) !important;
+    background:linear-gradient(135deg,
+      color-mix(in srgb,var(--ax-cyan) 18%,var(--ax-panel-soft)),
+      color-mix(in srgb,var(--ax-blue) 12%,var(--ax-panel))) !important;
+    box-shadow:inset 0 1px rgba(255,255,255,.07),0 7px 18px rgba(0,0,0,.18) !important;
+    font-weight:850 !important;
+  }
+  #aurelix-ui .ax-update-actions > button:hover:not(:disabled) {
+    transform:translateY(-1px) !important;
+    filter:brightness(1.13) saturate(1.1) !important;
+    border-color:color-mix(in srgb,var(--ax-cyan) 70%,white 8%) !important;
+  }
+  #aurelix-ui .ax-update-actions > button:active:not(:disabled) {
+    transform:translateY(1px) scale(.975) !important;
+  }
+  #aurelix-ui #ax-update-install:not(:disabled) {
+    color:#effff7 !important;
+    border-color:rgba(52,211,153,.56) !important;
+    background:linear-gradient(135deg,#047857,#059669 56%,#0d9488) !important;
+  }
+  #aurelix-ui .ax-update-actions > button:disabled {
+    color:color-mix(in srgb,var(--ax-muted) 78%,transparent) !important;
+    border-color:color-mix(in srgb,var(--ax-line) 74%,transparent) !important;
+    background:linear-gradient(135deg,
+      color-mix(in srgb,var(--ax-panel-soft) 96%,black 4%),
+      color-mix(in srgb,var(--ax-panel) 96%,black 4%)) !important;
+    box-shadow:inset 0 1px rgba(255,255,255,.025) !important;
+    opacity:.62 !important;
+    filter:none !important;
+  }
+
+  /* Save Config gets a real console action state. */
+  #aurelix-ui #ax-save-settings {
+    appearance:none !important;
+    border:1px solid color-mix(in srgb,var(--ax-violet) 48%,var(--ax-line)) !important;
+    border-radius:9px !important;
+    color:#fff !important;
+    background:linear-gradient(135deg,
+      color-mix(in srgb,var(--ax-violet) 31%,var(--ax-panel-soft)),
+      color-mix(in srgb,var(--ax-blue) 19%,var(--ax-panel))) !important;
+    box-shadow:inset 0 1px rgba(255,255,255,.08),0 6px 16px rgba(0,0,0,.18) !important;
+  }
+  #aurelix-ui #ax-save-settings.saved {
+    border-color:rgba(52,211,153,.62) !important;
+    background:linear-gradient(135deg,#047857,#059669) !important;
+  }
+  #aurelix-ui #ax-save-settings.failed {
+    border-color:rgba(251,113,133,.62) !important;
+    background:linear-gradient(135deg,#9f1239,#be123c) !important;
+  }
+
+  /* Richer shared surfaces for every existing theme. */
+  #aurelix-ui {
+    --ax-surface-top:color-mix(in srgb,var(--ax-panel-soft) 88%,var(--ax-cyan) 12%);
+    --ax-surface-bottom:color-mix(in srgb,var(--ax-panel) 94%,black 6%);
+    --ax-accent-haze:color-mix(in srgb,var(--ax-cyan) 12%,transparent);
+    --ax-violet-haze:color-mix(in srgb,var(--ax-violet) 10%,transparent);
+  }
+  #aurelix-ui .ax-card {
+    background:
+      radial-gradient(circle at 100% 0%,var(--ax-accent-haze),transparent 42%),
+      linear-gradient(150deg,var(--ax-surface-top),var(--ax-surface-bottom)) !important;
+    border-color:color-mix(in srgb,var(--ax-line) 76%,var(--ax-cyan) 24%) !important;
+    box-shadow:0 12px 28px rgba(0,0,0,.20),inset 0 1px rgba(255,255,255,.035) !important;
+  }
+  #aurelix-ui .ax-card-head {
+    background:linear-gradient(90deg,var(--ax-violet-haze),transparent 52%,var(--ax-accent-haze)) !important;
+  }
+  #aurelix-ui input,
+  #aurelix-ui select,
+  #aurelix-ui textarea {
+    background:color-mix(in srgb,var(--ax-panel) 92%,black 8%) !important;
+    border-color:color-mix(in srgb,var(--ax-line) 80%,var(--ax-cyan) 20%) !important;
+    color:var(--ax-text) !important;
+  }
+  #aurelix-ui input:focus,
+  #aurelix-ui select:focus,
+  #aurelix-ui textarea:focus {
+    outline:none !important;
+    border-color:color-mix(in srgb,var(--ax-cyan) 72%,white 7%) !important;
+    box-shadow:0 0 0 2px color-mix(in srgb,var(--ax-cyan) 15%,transparent) !important;
+  }
+  #aurelix-ui .ax-theme {
+    border:1px solid color-mix(in srgb,var(--ax-line) 65%,white 12%) !important;
+    box-shadow:inset 0 1px rgba(255,255,255,.13),0 5px 12px rgba(0,0,0,.18) !important;
+  }
+  #aurelix-ui .ax-theme.active {
+    border-color:#fff !important;
+    box-shadow:0 0 0 2px color-mix(in srgb,var(--ax-cyan) 44%,transparent),0 0 18px color-mix(in srgb,var(--ax-cyan) 22%,transparent) !important;
+  }
+
+  /* Individual theme depth tuning; no continuous animations added. */
+  #aurelix-ui[data-theme="aegis"]         { --ax-surface-top:#13283a; --ax-surface-bottom:#06111d; }
+  #aurelix-ui[data-theme="cyberpunk"]     { --ax-surface-top:#28133a; --ax-surface-bottom:#0b0715; }
+  #aurelix-ui[data-theme="frostbite"]     { --ax-surface-top:#153247; --ax-surface-bottom:#071722; }
+  #aurelix-ui[data-theme="voidglitch"]    { --ax-surface-top:#2c1034; --ax-surface-bottom:#0c0612; }
+  #aurelix-ui[data-theme="aurora"]        { --ax-surface-top:#153333; --ax-surface-bottom:#071817; }
+  #aurelix-ui[data-theme="solarFlare"]    { --ax-surface-top:#3b1b0e; --ax-surface-bottom:#160704; }
+  #aurelix-ui[data-theme="obsidianGold"]  { --ax-surface-top:#302918; --ax-surface-bottom:#0d0b07; }
+  #aurelix-ui[data-theme="sakuraNight"]   { --ax-surface-top:#371a31; --ax-surface-bottom:#140913; }
+  #aurelix-ui[data-theme="pitchBlack"]    { --ax-surface-top:#15191f; --ax-surface-bottom:#030405; }
+  #aurelix-ui[data-theme="toxicMatrix"]   { --ax-surface-top:#153019; --ax-surface-bottom:#050e06; }
+  #aurelix-ui[data-theme="inferno"]       { --ax-surface-top:#3b150c; --ax-surface-bottom:#150502; }
+  #aurelix-ui[data-theme="spectralGlass"] { --ax-surface-top:rgba(18,34,54,.82); --ax-surface-bottom:rgba(5,12,25,.88); }
+  #aurelix-ui[data-theme="neonNoir"]      { --ax-surface-top:#121e2a; --ax-surface-bottom:#04070b; }
+  #aurelix-ui[data-theme="deepOcean"]     { --ax-surface-top:#0b3040; --ax-surface-bottom:#03131b; }
+  #aurelix-ui[data-theme="bloodMoon"]     { --ax-surface-top:#3a111d; --ax-surface-bottom:#14050a; }
+  #aurelix-ui[data-theme="ultraviolet"]   { --ax-surface-top:#32134d; --ax-surface-bottom:#0d0618; }
+
+
   `;
   const mini = document.createElement('button');
   mini.id = 'aurelix-mini';
@@ -8414,7 +9866,8 @@ async function aurelixGetUpdateStatus(force = false) {
     if (open) renderSummaryDetails();
   }
   function renderOverview() {
-    const t = appState.currentTarget;
+    const current = appState.currentTarget;
+    const t = current?.phaseWaiting && current?.phaseStage !== 'phase3' ? null : current;
     const targetNameEl = $('#ax-target-name');
     targetNameEl.textContent = t?.name ? displayTargetName(t.name) : 'No active target';
     targetNameEl.classList.toggle('has-target', !!t?.name);
@@ -8470,10 +9923,28 @@ async function aurelixGetUpdateStatus(force = false) {
     $('#ax-sum-errors').textContent = fmt(appState.summary.errors);
     renderSummaryDetails();
 
+    const runtime = window.AURELIX_ENGINE?.getRuntimeState?.() || {};
+    root.dataset.running = appState.running ? 'true' : 'false';
+    const pipeline = Array.isArray(runtime.livePipeline?.pipeline) ? runtime.livePipeline.pipeline : [];
+    $$('.ax-pipe-node').forEach(node => {
+      node.classList.remove('done','active');
+      const item = pipeline.find(x => x.key === node.dataset.pipe);
+      if (item?.state === 'done') node.classList.add('done');
+      if (item?.state === 'active') node.classList.add('active');
+    });
+    const perf = runtime.performance || {};
+    const sched = runtime.scheduler || {};
+    const avgReq = Number(perf.avgRequestMs || 0);
+    const avgDecision = Number(perf.avgDecisionMs || 0);
+    const networkEl = $('#ax-health-network'), decisionEl = $('#ax-health-decision'), queueEl = $('#ax-health-queue');
+    if (networkEl) { networkEl.textContent = avgReq ? `${Math.round(avgReq)} ms` : 'READY'; networkEl.className = avgReq > 1200 ? 'ax-health-warn' : 'ax-health-good'; }
+    if (decisionEl) { decisionEl.textContent = avgDecision ? `${avgDecision.toFixed(1)} ms` : '<1 ms'; decisionEl.className = avgDecision > 20 ? 'ax-health-warn' : 'ax-health-good'; }
+    if (queueEl) { queueEl.textContent = `${Number(sched.queued||0)} queued`; queueEl.className = Number(sched.queued||0) > 4 ? 'ax-health-warn' : 'ax-health-good'; }
+
     const toggleBtn = $('#ax-engine-toggle');
     toggleBtn.textContent = appState.running ? '🛑 Stop Engine' : '🚀 Start Engine';
-    toggleBtn.style.background = appState.running ? 'var(--ax-red)' : 'var(--ax-green)';
-    toggleBtn.style.color = appState.running ? '#fff' : '#000';
+    toggleBtn.style.removeProperty('background');
+    toggleBtn.style.color = '#fff';
 
     $('#ax-action-title').textContent = appState.running
       ? (t ? `🎯 Targeting ${t.name}` : '⌁ Scanning')
@@ -8488,7 +9959,9 @@ async function aurelixGetUpdateStatus(force = false) {
     const h = String(Math.floor(sec / 3600)).padStart(2,'0');
     const m = String(Math.floor((sec % 3600) / 60)).padStart(2,'0');
     const s = String(sec % 60).padStart(2,'0');
-    $('#ax-sum-runtime').textContent = `${h}:${m}:${s}`;
+    const runtimeLabel = `${h}:${m}:${s}`;
+    const runtimeElement = $('#ax-sum-runtime');
+    if (runtimeElement && runtimeElement.textContent !== runtimeLabel) runtimeElement.textContent = runtimeLabel;
   }
   let logsDirty = false;
   const UI_LOG_TYPES = new Set(['system','scan','target','start','stop','attack','skill','hp','mana','stamina','resource','loot','success','warning','error']);
@@ -8526,9 +9999,6 @@ async function aurelixGetUpdateStatus(force = false) {
     potions: true,
     presets: true
   };
-  // Drafts live independently of rendered input elements. A scanner refresh can
-  // rebuild the Targets view, but it must never replace a value the user is
-  // currently editing or waiting to debounce-save.
   const pendingTargetLimits = new Map();
   const targetLimitDraftKey = (key, phase) => `${key || ''}|${phase === 'phase3' ? 'phase3' : 'phase1'}`;
   function displayedTargetLimit(target, phase) {
@@ -8554,7 +10024,7 @@ async function aurelixGetUpdateStatus(force = false) {
       structuralDirty.potions = false;
       renderPotions();
     }
-    if (structuralDirty.presets && isViewActive('presets')) {
+    if (structuralDirty.presets && (isViewActive('presets') || isViewActive('assignments'))) {
       structuralDirty.presets = false;
       renderPresets();
     }
@@ -8672,16 +10142,20 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!equipmentBox || !petBox) return;
     const card = (preset, kind, isActive, meta) => `
       <div class="ax-preset-card${isActive ? ' is-active' : ''}" data-preset-kind="${kind}" data-preset-id="${safe(preset.id)}">
-        <div>
-          <input class="ax-search ax-preset-rename" maxlength="40" value="${safe(preset.name)}" aria-label="Preset name" style="margin-bottom:4px;">
-          <small>${safe(meta)}${isActive ? ' • ACTIVE' : ''}</small>
+        <div class="ax-preset-card-top">
+          <span class="ax-preset-kind-icon">${kind === 'pet' ? '🐾' : '⚔️'}</span>
+          <div class="ax-preset-card-copy">
+            <input class="ax-search ax-preset-rename" maxlength="40" value="${safe(preset.name)}" aria-label="Preset name">
+            <small>${safe(meta)}</small>
+          </div>
+          ${isActive ? '<span class="ax-active-preset-badge">● ACTIVE</span>' : ''}
         </div>
         <div class="ax-preset-actions">
-          ${kind === 'pet' ? `<button class="ax-mini-action" data-preset-action="edit" type="button" title="Edit formation">✎</button><button class="ax-mini-action" data-preset-action="duplicate" type="button" title="Duplicate preset">⧉</button>` : ''}
-          <button class="ax-mini-action" data-preset-action="rename" type="button" title="Save name">✓</button>
-          <button class="ax-mini-action" data-preset-action="update" type="button" title="Update from equipped">↻</button>
-          <button class="ax-mini-action" data-preset-action="equip" type="button" title="Equip and verify">⚡</button>
-          <button class="ax-mini-action danger" data-preset-action="delete" type="button" title="Delete preset">🗑️</button>
+          ${kind === 'pet' ? `<button class="ax-preset-action" data-preset-action="edit" type="button" title="Edit formation"><span>✏️</span>Edit</button><button class="ax-preset-action" data-preset-action="duplicate" type="button" title="Duplicate preset"><span>📑</span>Copy</button>` : ''}
+          <button class="ax-preset-action" data-preset-action="rename" type="button" title="Save name"><span>✅</span>Rename</button>
+          <button class="ax-preset-action" data-preset-action="update" type="button" title="Update from equipped"><span>🔄</span>Update</button>
+          <button class="ax-preset-action ax-equip-action" data-preset-action="equip" type="button" title="Equip and verify"><span>⚡</span>Equip</button>
+          <button class="ax-preset-action danger" data-preset-action="delete" type="button" title="Delete preset"><span>🗑️</span>Delete</button>
         </div>
       </div>`;
     equipmentBox.innerHTML = equipment.length ? equipment.map(p => {
@@ -8856,19 +10330,118 @@ async function aurelixGetUpdateStatus(force = false) {
       else { item.damageLimit = damageLimit; item.phase1DamageLimit = damageLimit; }
     }
   };
+  let axLastDiagnostic = '';
+  const axDiagSafe = (fn, fallback = null) => { try { return fn(); } catch (e) { return { diagnosticError: String(e?.message || e).slice(0,180) }; } };
+  const axDiagFields = (obj, keys) => Object.fromEntries(keys.map(k => [k, obj?.[k] ?? null]));
+  function axCaptureDiagnostic() {
+    const scan = axDiagSafe(() => window.AURELIX?.getReport?.());
+    const runtime = axDiagSafe(() => window.AURELIX_ENGINE?.getRuntimeState?.());
+    const policies = axDiagSafe(() => window.AURELIX_ENGINE?.getTargetPolicies?.(), []);
+    const uiModels = axDiagSafe(() => window.AURELIX_ENGINE?.getTargetUiModels?.(), []);
+    const catalog = axDiagSafe(() => window.AURELIX_ENGINE?.getTargetCatalog?.(), []);
+    const loadouts = axDiagSafe(() => window.AURELIX_ENGINE?.getLoadoutState?.());
+    const logs = axDiagSafe(() => window.AURELIX_ENGINE?.getLogs?.(), []);
+    const waveList = Array.isArray(scan?.gateTopology?.waves) ? scan.gateTopology.waves : [];
+    const entities = Array.isArray(scan?.entities) ? scan.entities : [];
+    const byGate = {};
+    for (const e of entities) {
+      if (e?.source !== 'gate') continue;
+      const gate = String(e.gateName || e.gateId || e.location || 'unknown').slice(0,100);
+      const wave = String(e.waveDisplay || e.waveName || e.waveId || 'unknown').slice(0,60);
+      const k = `${gate} / ${wave}`;
+      (byGate[k] ||= []).push({ name: String(e.name || '').slice(0,120), entityId: e.entityId ?? null, eligible: e.targetEligible ?? null });
+    }
+    const shortRows = (items, keys, max=250) => Array.isArray(items) ? items.slice(0,max).map(x => axDiagFields(x,keys)) : [];
+    const report = {
+      diagnosticVersion: '4.0', capturedAt: new Date().toISOString(),
+      automatedInvestigation: AURELIX_TRACE.analyze(),
+      context: { page: location.pathname, visibility: document.visibilityState, viewport: {width:innerWidth,height:innerHeight}, device: /Android|Mobile|iPhone/i.test(navigator.userAgent)?'mobile':'desktop', online:navigator.onLine },
+      api: { scannerVersion:window.AURELIX?.version || null, engineVersion:window.AURELIX_ENGINE?.version || null, scanner:!!window.AURELIX?.getReport, engine:!!window.AURELIX_ENGINE?.getRuntimeState, uiTargets:appState.targets?.length ?? null },
+      scanner: {
+        scanSeq:scan?.scanSeq ?? null, generatedAt:scan?.generatedAt ?? null,
+        coverage:scan?.gateTopology?.coverage ?? null,
+        waveCount:waveList.length, parsedGateWaveCount:scan?.gateWaves?.length ?? null,
+        waves:shortRows(waveList,['gateName','gateId','waveId','waveDisplay','url'],300),
+        gateMonsterGroups:byGate, entityCount:entities.length,
+        sources:entities.reduce((a,e)=>{const k=String(e?.source||'unknown');a[k]=(a[k]||0)+1;return a;},{}),
+        errors:Array.isArray(scan?.errors)?scan.errors.slice(-30).map(e=>typeof e==='string'?e.slice(0,350):axDiagFields(e,['source','stage','message','status','code'])):[],
+        targetIds:scan?.targets?.entityIds?.slice?.(0,350) ?? null
+      },
+      targets: { policies:shortRows(policies,['key','name','enabled','selected','damageLimit','phase1DamageLimit','phase3DamageLimit','phase3Only'],350), catalog:shortRows(catalog,['key','name','source','gateName','waveId','waveDisplay','enabled'],350), ui:shortRows(uiModels,['key','name','source','gateName','waveId','enabled'],350), renderedCount:appState.targets?.length ?? 0, renderedGrakthar:(appState.targets||[]).filter(x=>/grakthar/i.test([x.name,x.gateName,x.waveName,x.key].join(' '))).map(x=>axDiagFields(x,['key','name','gateName','waveId','waveName','enabled'])) },
+      engine: { ...axDiagFields(runtime,['state','running','paused','lastDecisionAt','lastScannerSeq','lastReportGeneratedAt','lastError','attackInFlight','potionInFlight','lootInFlight','loadoutInFlight']), currentTarget:axDiagFields(runtime?.currentTarget,['name','key','entityId','phaseStage','phaseWaiting','source','waveId']), currentPlan:axDiagFields(runtime?.currentPlan,['nextStage','reason','targetKey']), pipeline:runtime?.livePipeline ?? null, summary:runtime?.summary ?? null, performance:runtime?.performance ?? null, scheduler:runtime?.scheduler ?? null },
+      loadouts: { available:!!loadouts, active:axDiagFields(runtime?.activeLoadout,['equipment','pet','equipmentPresetId','petPresetId']), stateSummary:loadouts && typeof loadouts==='object'?Object.fromEntries(Object.entries(loadouts).map(([k,v])=>[k,Array.isArray(v)?{count:v.length}:typeof v==='object'&&v?{keys:Object.keys(v).slice(0,20)}:typeof v])):null },
+      skills: { discoveredCount:Array.isArray(runtime?.activeSkills)?runtime.activeSkills.length:Object.keys(runtime?.activeSkills||{}).length, policyCount:Array.isArray(runtime?.activeSkillTargets)?runtime.activeSkillTargets.length:Object.keys(runtime?.activeSkillTargets||{}).length },
+      resources: { available:!!runtime?.resources, keys:Object.keys(runtime?.resources||{}) },
+      recentLogs:Array.isArray(logs)?logs.slice(-100).map(x=>({level:x?.level||x?.type||null,at:x?.time||x?.timestamp||null,message:String(x?.message||'').slice(0,350)})):[],
+      note:'Read-only report of passively collected evidence. No diagnostic network requests. Findings distinguish confirmed symptoms from unverified causes.'
+    };
+    const json=JSON.stringify(report, (k,v)=>{
+      if(/token|csrf|secret|password|cookie|authorization|sessionid|intent/i.test(k)) return '[REDACTED]';
+      if(typeof v==='string') return v.replace(/https?:\/\/[^\s\"']+/g, u=>{try {const parsed=new URL(u);return parsed.origin+parsed.pathname;}catch{return '[URL]';}}).replace(/((?:token|csrf|secret|password|authorization|cookie|intent)\s*[:=]\s*)[^\s,;]+/gi,'$1[REDACTED]');
+      return v;
+    },2);
+    return json.replace(/(Bearer\s+)[A-Za-z0-9._~-]+/gi,'$1[REDACTED]');
+  }
+  function axDiagStatus(message) { const el=$('#ax-diag-status'); if(el) el.textContent=message; }
+  function axSelectDiagnostic() {
+    const output=$('#ax-diag-output');
+    if(!output) return false;
+    output.removeAttribute('readonly');
+    output.focus(); output.select(); output.setSelectionRange(0,output.value.length);
+    output.setAttribute('readonly','');
+    return true;
+  }
+  async function axCopyDiagnostic() {
+    if(navigator.clipboard && typeof navigator.clipboard.writeText==='function') {
+      try { await navigator.clipboard.writeText(axLastDiagnostic); return true; } catch (_) {}
+    }
+    if(!axSelectDiagnostic()) return false;
+    try { if(typeof document.execCommand==='function' && document.execCommand('copy')) return true; } catch (_) {}
+    return false;
+  }
+  function axSaveDiagnostic() {
+    if(typeof Blob!=='function' || !URL.createObjectURL) throw new Error('File download is unsupported; use Copy Report or select the text.');
+    const blob=new Blob([axLastDiagnostic],{type:'application/json;charset=utf-8'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='AURELIX_Diagnostic_'+new Date().toISOString().slice(0,10)+'.json';
+    a.style.display='none'; document.body.appendChild(a);
+    try { a.click(); } finally { a.remove(); setTimeout(()=>URL.revokeObjectURL(url),30000); }
+  }
+  shadow.addEventListener('click', async event => {
+    const clicked=event.target;
+    const btn=clicked && typeof clicked.closest==='function' ? clicked.closest('#ax-diag-capture,#ax-diag-copy,#ax-diag-download,#ax-diag-share') : null;
+    if(!btn) return;
+    try {
+      if(btn.id==='ax-diag-capture'||!axLastDiagnostic) {
+        axLastDiagnostic=axCaptureDiagnostic();
+        const output=$('#ax-diag-output'); if(output) output.value=axLastDiagnostic;
+      }
+      if(btn.id==='ax-diag-copy') {
+        const copied=await axCopyDiagnostic();
+        axDiagStatus(copied?'Report copied. Review it before sharing.':'Report selected. Use your browser text-selection Copy option.');
+      } else if(btn.id==='ax-diag-download') {
+        try { axSaveDiagnostic(); axDiagStatus('Download requested. If your browser blocks it, use Copy Report or Share Report.'); }
+        catch(e) { axSelectDiagnostic(); axDiagStatus(String(e.message||e)); }
+      } else if(btn.id==='ax-diag-share') {
+        if(typeof navigator.share==='function') {
+          try {
+            const file=typeof File==='function'?new File([axLastDiagnostic],'AURELIX_Diagnostic.json',{type:'application/json'}):null;
+            if(file && typeof navigator.canShare==='function' && navigator.canShare({files:[file]})) {
+              await navigator.share({files:[file],title:'AURELIX Diagnostic'});
+            } else await navigator.share({title:'AURELIX Diagnostic',text:axLastDiagnostic});
+            axDiagStatus('Share sheet opened. Review the destination before sending.');
+          } catch(e) {
+            if(e?.name==='AbortError') axDiagStatus('Sharing cancelled.');
+            else { axSelectDiagnostic(); axDiagStatus('Sharing unavailable. Report selected for manual copy.'); }
+          }
+        } else { axSelectDiagnostic(); axDiagStatus('Sharing unsupported here. Report selected for manual copy.'); }
+      } else axDiagStatus('Snapshot captured ('+axLastDiagnostic.length.toLocaleString()+' characters).');
+    } catch(error) {axDiagStatus('Diagnostic failed: '+String(error?.message||error).slice(0,180));}
+  });
   shadow.addEventListener('click', async event => {
     const clicked = event.target instanceof Element ? event.target : null;
     if (!clicked) return;
-    const subview = clicked.closest('[data-preset-subview]');
-    if (subview) {
-      const name = subview.dataset.presetSubview;
-      $$('[data-preset-subview]').forEach(button => button.classList.toggle('active', button === subview));
-      $$('[data-preset-panel]').forEach(panel => {
-        panel.style.display = panel.dataset.presetPanel === name ? 'block' : 'none';
-      });
-      return;
-    }
-
     if (clicked.closest('#ax-auto-loot')) {
       const btn = clicked.closest('#ax-auto-loot');
       const isOn = btn.classList.toggle('on');
@@ -9189,7 +10762,7 @@ async function aurelixGetUpdateStatus(force = false) {
     if (name === 'logs' && logsDirty) renderLogs();
     renderStructuralIfVisible();
     if (name === 'combat') void refreshSkillsIntoUi(true);
-    if (name === 'presets') refreshLoadoutUi();
+    if (name === 'presets' || name === 'assignments') refreshLoadoutUi();
     if (name === 'overview') renderOverview();
     if (name === 'updates') renderAurelixUpdateCenter();
   }
@@ -9213,7 +10786,6 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
   const channel = $('#ax-update-channel');
   const checked = $('#ax-update-checked');
 
-  // Update Center may not exist in older/cached UI markup.
   if (
     !badge ||
     !current ||
@@ -9288,7 +10860,7 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       badge.textContent = 'CHECKING';
 
       status.innerHTML = `
-        <div class="ax-update-status-icon">◌</div>
+        <div class="ax-update-status-icon">⏳</div>
 
         <div>
           <div class="ax-update-status-title">
@@ -9305,13 +10877,14 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       checkButton.textContent = '⏳ Checking...';
 
       installButton.disabled = true;
+      installButton.textContent = '🛡️ Verify & Install';
       break;
 
     case 'current':
       badge.textContent = 'UP TO DATE';
 
       status.innerHTML = `
-        <div class="ax-update-status-icon">✓</div>
+        <div class="ax-update-status-icon">✅</div>
 
         <div>
           <div class="ax-update-status-title">
@@ -9325,16 +10898,41 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       `;
 
       checkButton.disabled = false;
+      checkButton.textContent = '🔄 Check Again';
+
+      installButton.disabled = true;
+      installButton.textContent = '🛡️ Verify & Install';
+      break;
+
+    case 'ahead':
+      badge.textContent = 'LOCAL BUILD AHEAD';
+
+      status.innerHTML = `
+        <div class="ax-update-status-icon">🧪</div>
+
+        <div>
+          <div class="ax-update-status-title">
+            This AURELIX build is newer than the published release
+          </div>
+
+          <div class="ax-update-status-sub">
+            Installed ${state.currentVersion} • Published ${state.latestVersion}. Update installation is intentionally disabled until GitHub publishes a newer version.
+          </div>
+        </div>
+      `;
+
+      checkButton.disabled = false;
       checkButton.textContent = '🔍 Check Again';
 
       installButton.disabled = true;
+      installButton.textContent = '🔒 No Newer Release';
       break;
 
     case 'available':
       badge.textContent = 'UPDATE AVAILABLE';
 
       status.innerHTML = `
-        <div class="ax-update-status-icon">↑</div>
+        <div class="ax-update-status-icon">⬆️</div>
 
         <div>
           <div class="ax-update-status-title">
@@ -9348,16 +10946,17 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       `;
 
       checkButton.disabled = false;
-      checkButton.textContent = '🔍 Check Again';
+      checkButton.textContent = '🔄 Check Again';
 
       installButton.disabled = false;
+      installButton.textContent = '🛡️ Verify & Install';
       break;
 
     case 'error': {
       badge.textContent = 'CHECK FAILED';
 
       status.innerHTML = `
-        <div class="ax-update-status-icon">!</div>
+        <div class="ax-update-status-icon">⚠️</div>
 
         <div>
           <div class="ax-update-status-title">
@@ -9380,6 +10979,7 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       checkButton.textContent = '↻ Retry';
 
       installButton.disabled = true;
+      installButton.textContent = '🛡️ Verify & Install';
       break;
     }
 
@@ -9387,7 +10987,7 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       badge.textContent = 'NOT CHECKED';
 
       status.innerHTML = `
-        <div class="ax-update-status-icon">◌</div>
+        <div class="ax-update-status-icon">⏳</div>
 
         <div>
           <div class="ax-update-status-title">
@@ -9401,9 +11001,10 @@ function renderAurelixUpdateCenter(state = AURELIX_UPDATE_STATE) {
       `;
 
       checkButton.disabled = false;
-      checkButton.textContent = '🔍 Check Update';
+      checkButton.textContent = '🔎 Check for Update';
 
       installButton.disabled = true;
+      installButton.textContent = '🛡️ Verify & Install';
       break;
   }
 }
@@ -9431,54 +11032,57 @@ $('#ax-update-check')?.addEventListener('click', async () => {
     );
   }
 });
-$('#ax-update-install')?.addEventListener('click', () => {
+$('#ax-update-install')?.addEventListener('click', async () => {
   const state = AURELIX_UPDATE_STATE;
+  const button = $('#ax-update-install');
 
-  // Never install unless a newer version was actually verified.
   if (
     state.status !== 'available' ||
     !state.latestVersion ||
-    aurelixCompareVersions(
-      state.latestVersion,
-      AURELIX_UPDATE.currentVersion
-    ) <= 0
+    aurelixCompareVersions(state.latestVersion, AURELIX_UPDATE.currentVersion) <= 0
   ) {
+    addLog('warning', 'Update installer blocked because no newer verified AURELIX release is available.');
     renderAurelixUpdateCenter();
     return;
   }
 
-  const releaseDownloadURL =
-    state.release?.download_url ||
-    AURELIX_UPDATE.downloadURL;
-
   try {
-    const url = new URL(releaseDownloadURL);
+    const url = aurelixTrustedUpdateURL(state.release);
 
-    // Only allow the trusted AURELIX GitHub release location.
-    if (
-      url.protocol !== 'https:' ||
-      url.hostname !== 'raw.githubusercontent.com' ||
-      !url.pathname.startsWith('/cosmic451/AURELIX/')
-    ) {
-      throw new Error('Untrusted AURELIX update URL.');
+    if (button) {
+      button.disabled = true;
+      button.textContent = '🛡️ Verifying Installer...';
     }
 
+    const verified = await aurelixVerifyInstaller(url, state.latestVersion);
+
     addLog(
-      'info',
-      `Opening AURELIX ${state.latestVersion} installer...`
+      'system',
+      `Verified AURELIX ${verified.version} installer (${verified.bytes.toLocaleString()} bytes). Opening userscript manager...`
     );
 
-    window.open(
-      url.href,
-      '_blank',
-      'noopener,noreferrer'
-    );
+    if (typeof GM_openInTab === 'function') {
+      GM_openInTab(url, {
+        active: true,
+        insert: true,
+        setParent: true
+      });
+    } else {
+      const opened = window.open(url, '_blank', 'noopener,noreferrer');
+      if (!opened) throw new Error('Browser blocked the installer tab.');
+    }
 
+    if (button) {
+      button.textContent = '✅ Installer Opened';
+      setTimeout(() => renderAurelixUpdateCenter(), 1600);
+    }
   } catch (error) {
-    addLog(
-      'error',
-      `Unable to open AURELIX update: ${error?.message || error}`
-    );
+    addLog('error', `Unable to install AURELIX update: ${error?.message || error}`);
+
+    if (button) {
+      button.disabled = false;
+      button.textContent = '⚠️ Retry Install';
+    }
   }
 });
 
@@ -9498,6 +11102,17 @@ renderAurelixUpdateCenter();
     targetSearchTimer = setTimeout(() => { targetSearchTimer = null; renderTargets(); }, 90);
   });
   $('#ax-target-filter').addEventListener('change', renderTargets);
+  $$('.ax-mode-btn[data-performance-mode]').forEach(btn => btn.addEventListener('click', () => {
+    const mode = btn.dataset.performanceMode;
+    $$('.ax-mode-btn[data-performance-mode]').forEach(x => x.classList.toggle('active', x === btn));
+    window.AURELIX_ENGINE?.setSettings?.({ performanceMode: mode });
+    addLog('system', `Performance profile changed to ${String(mode).toUpperCase()}.`);
+  }));
+  try {
+    const savedPerformanceMode = window.AURELIX_ENGINE?.getSettings?.()?.performanceMode || 'balanced';
+    $$('.ax-mode-btn[data-performance-mode]').forEach(x => x.classList.toggle('active', x.dataset.performanceMode === savedPerformanceMode));
+  } catch (_) {}
+
   $('#ax-engine-toggle').addEventListener('click', async () => {
     const engine = window.AURELIX_ENGINE;
     if (!engine) {
@@ -9578,6 +11193,20 @@ renderAurelixUpdateCenter();
     uiStoreSet(STORE.theme, root.dataset.theme || DEFAULTS.theme);
     uiStoreSet(STORE.effects, root.classList.contains('ax-effects-off') ? '0' : '1');
     uiStoreSet(STORE.tab, $('.ax-nav-btn.active')?.dataset?.view || 'overview');
+
+    const uiCheckpoint = {
+      savedAt: new Date().toISOString(),
+      tab: $('.ax-nav-btn.active')?.dataset?.view || 'overview',
+      minimized: uiStoreGet(STORE.minimized, '0'),
+      width: String(width),
+      height: String(height),
+      scale: String(scalePct / 100),
+      theme: root.dataset.theme || DEFAULTS.theme,
+      effects: root.classList.contains('ax-effects-off') ? '0' : '1',
+      miniX: uiStoreGet(STORE.miniX, ''),
+      miniY: uiStoreGet(STORE.miniY, '')
+    };
+    uiStoreSet(STORE.checkpoint, JSON.stringify(uiCheckpoint));
   }
   $('#ax-save-settings').addEventListener('click', () => {
     const button = $('#ax-save-settings');
@@ -9585,11 +11214,21 @@ renderAurelixUpdateCenter();
     try {
       commitAllVisibleConfiguration();
       const result = window.AURELIX_ENGINE?.saveAllConfiguration?.();
-      const ok = result?.ok === true;
+      let uiVerified = false;
+      try {
+        const uiCheckpoint = JSON.parse(String(uiStoreGet(STORE.checkpoint, '') || 'null'));
+        uiVerified = !!uiCheckpoint &&
+          String(uiCheckpoint.width) === String(uiStoreGet(STORE.width, '')) &&
+          String(uiCheckpoint.height) === String(uiStoreGet(STORE.height, '')) &&
+          String(uiCheckpoint.scale) === String(uiStoreGet(STORE.scale, '')) &&
+          String(uiCheckpoint.theme) === String(uiStoreGet(STORE.theme, '')) &&
+          String(uiCheckpoint.effects) === String(uiStoreGet(STORE.effects, ''));
+      } catch (_) {}
+      const ok = result?.ok === true && uiVerified;
       button.classList.toggle('saved', ok);
       button.classList.toggle('failed', !ok);
       button.textContent = ok ? '✓ Saved' : '⚠ Failed';
-      addLog(ok ? 'success' : 'error', ok ? 'All settings saved.' : 'Settings save verification failed.');
+      addLog(ok ? 'success' : 'error', ok ? 'All AURELIX configuration saved and verified.' : 'Configuration save verification failed.');
     } catch (error) {
       button.classList.remove('saved');
       button.classList.add('failed');
@@ -9685,11 +11324,19 @@ renderAurelixUpdateCenter();
     if (panelScan) panelScan.classList.toggle('show', scanning);
     if (!el) return;
     if (scanning) {
-      el.innerHTML = `<span class="ax-scan-indicator"><span class="ax-scan-spinner"></span>Scanning world…</span>`;
+      const markup = `<span class="ax-scan-indicator"><span class="ax-scan-spinner"></span>Scanning world…</span>`;
+      if (el.dataset.axScannerView !== 'busy') {
+        el.innerHTML = markup;
+        el.dataset.axScannerView = 'busy';
+      }
       return;
     }
     const report = discoverScannerReport();
-    el.textContent = report ? `Scanner: ${report.version || 'connected'}` : 'Scanner: waiting';
+    const nextText = report ? `Scanner: ${report.version || 'connected'}` : 'Scanner: waiting';
+    if (el.dataset.axScannerView !== nextText) {
+      el.textContent = nextText;
+      el.dataset.axScannerView = nextText;
+    }
   }
   function discoverScannerReport() {
     try {
@@ -9936,7 +11583,7 @@ renderAurelixUpdateCenter();
     unsubscribeUiScanner = window.AURELIX.subscribe(event => {
       if (event.type === 'scan-start') scannerBusy = true;
       if (event.type === 'scan-end' || event.type === 'scan-error') scannerBusy = false;
-      renderScannerState();
+      if (root.style.display !== 'none') renderScannerState();
       if (event.type === 'scan-complete' && event.report) {
         const token = `${event.report.scanSeq ?? ''}:${event.report.generatedAt ?? ''}`;
         if (token !== lastReportToken) {
@@ -9968,35 +11615,5 @@ renderAurelixUpdateCenter();
       console.error('[AURELIX UI] scanner hydrate failed', error);
     }
   }, 15000);
-  window.AURELIX_SELF_TEST = () => {
-    const report = window.AURELIX?.getReport?.();
-    const checks = {
-      scannerApi: !!window.AURELIX?.scanNow,
-      scannerSingleScheduler: !!window.AURELIX?.status?.().scheduled,
-      engineApi: !!window.AURELIX_ENGINE?.getRuntimeState,
-      uiShadowRoot: !!document.querySelector('#aurelix-host')?.shadowRoot,
-      targetPoliciesReadable: false,
-      potionPolicyReadable: false,
-      combatApi: !!window.AURELIX_ENGINE?.runtimeEncounterKey,
-      liveCombatEnabled: window.AURELIX_ENGINE?.getRuntimeState?.().liveActionsEnabled === true,
-      attackIdle: window.AURELIX_ENGINE?.getRuntimeState?.().attackInFlight === false,
-      reportPresent: !!report,
-      reportErrors: Array.isArray(report?.errors) ? report.errors.length : null,
-      persistenceBackend: typeof GM_getValue === 'function' && typeof GM_setValue === 'function' ? 'GM+localStorage' : 'localStorage',
-      stablePotionPolicies: true,
-      smartLootUsesRemainingExp: true,
-      delegatedRowEvents: true,
-      panelPointerIsolation: true,
-      cookieOverrideWindowMinimized: true,
-      potionPolicyScannerIndependent: true,
-      dungeonLootPriority: true,
-      dungeonLootCandidateFallback: true,
-      bulkActiveSkillTargetSelection: !!window.AURELIX_ENGINE?.bulkSetActiveSkillTargetPolicies,
-      lazyLogRendering: true,
-      eventDrivenRuntimeSync: true
-    };
-    try { checks.targetPoliciesReadable = Array.isArray(window.AURELIX_ENGINE?.getTargetPolicies?.()); } catch {}
-    try { checks.potionPolicyReadable = !!window.AURELIX_ENGINE?.getPotionPolicy?.(); } catch {}
-    return checks;
-  };
+
 })();
