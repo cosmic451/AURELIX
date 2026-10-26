@@ -1,9 +1,15 @@
 {
-  "version": "0.5.74",
-  "released": "2026-09-28",
+  "version": "0.6.4",
+  "released": "2026-10-26",
   "channel": "stable",
   "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
   "changelog": [
-    "Improved Engine Speed And Functionality."
+    "🛡️ Advanced error recovery with smarter retries and server protection.",
+    "⚔️ Improved phase combat and Phase-3-only targeting.",
+    "💎 Enhanced dungeon Auto Loot with previous-instance reward recovery.",
+    "⚡ Faster monster scanning with caching and concurrent requests.",
+    "🐾 Improved equipment, pet presets, and crystal handling.",
+    "🔍 Advanced Engine Diagnostics and performance monitoring.",
+    "🔐 Secure update verification and optimized code maintenance."
   ]
 }
