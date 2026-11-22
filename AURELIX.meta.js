@@ -6,3 +6,4 @@
 // @updateURL    https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.meta.js
 // @downloadURL  https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js
 // ==/UserScript==
+
