@@ -106,7 +106,6 @@ const AURELIX_TRACE = (() => {
   window.addEventListener('unhandledrejection', e => record('unhandled-rejection', {message:e.reason?.message || String(e.reason),stack:e.reason?.stack}));
   return Object.freeze({record, analyze});
 })();
-
 /* =========================================================
    AURELIX UPDATE SYSTEM
    ========================================================= */
