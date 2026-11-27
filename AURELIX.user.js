@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AURELIX Auto Engine
 // @author       Cosmic
-// @version      0.7.2
-// @description  AURELIX automation engine with smart combat, presets, resource recovery, Gate/Wave auto loot, and adaptive targeting (dungeon loot temporarily disabled).
+// @version      0.7.4
+// @description  AURELIX automation engine with smart combat, presets, resource recovery, Gate/Wave & Dungeon auto loot, and adaptive targeting.
 // @icon         https://raw.githubusercontent.com/cosmic451/afb-assets/main/aurelixauto.png
 // @match        https://demonicscans.org/*
 // @updateURL    https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.meta.js
@@ -16,10 +16,124 @@
 // @run-at       document-end
 // ==/UserScript==
 
+
+/* ========================================================================
+   MODULE 1: SHARED UTILITIES (AURELIX_SHARED)
+   Deduplicated helpers shared across Scanner, Engine, and UI.
+   ======================================================================== */
+const AURELIX_SHARED = (() => {
+  'use strict';
+  const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+
+  function sleep(ms, signal = null) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+      let onAbort = null;
+      const timer = setTimeout(() => {
+        if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+        resolve();
+      }, ms);
+      if (signal?.addEventListener) {
+        onAbort = () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  function clone(value) {
+    if (value == null) return value;
+    try { return structuredClone(value); }
+    catch (_) { return JSON.parse(JSON.stringify(value)); }
+  }
+
+  function normalizeSpace(value) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  function normalizeName(value) {
+    return normalizeSpace(value)
+      .toLowerCase()
+      .replace(/[’‘]/g, "'")
+      .replace(/[“”]/g, '"');
+  }
+
+  function parseHtml(html) {
+    return new DOMParser().parseFromString(String(html || ''), 'text/html');
+  }
+
+  async function mapWithConcurrency(items, limit, worker) {
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) return [];
+    const results = new Array(list.length);
+    let cursor = 0;
+    const workerCount = Math.max(1, Math.min(Math.floor(Number(limit) || 1), list.length));
+    const runners = Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = cursor++;
+        if (index >= list.length) return;
+        results[index] = await worker(list[index], index);
+      }
+    });
+    await Promise.all(runners);
+    return results;
+  }
+
+  function readCookieValue(name) {
+    const encoded = encodeURIComponent(String(name));
+    const parts = String(document.cookie || '').split(/;\s*/);
+    for (const part of parts) {
+      const eq = part.indexOf('=');
+      const rawName = eq >= 0 ? part.slice(0, eq) : part;
+      let decodedName = rawName;
+      try { decodedName = decodeURIComponent(rawName); } catch (_) {}
+      if (rawName === encoded || decodedName === String(name)) {
+        const rawValue = eq >= 0 ? part.slice(eq + 1) : '';
+        try { return decodeURIComponent(rawValue); } catch (_) { return rawValue; }
+      }
+    }
+    return null;
+  }
+
+  function sharedGateCookieMutex() {
+    const key = '__AURELIX_GATE_COOKIE_MUTEX__';
+    if (!window[key] || typeof window[key] !== 'object') {
+      window[key] = { tail: Promise.resolve() };
+    }
+    return window[key];
+  }
+
+  async function withSharedGateCookieLock(fn) {
+    const mutex = sharedGateCookieMutex();
+    const task = Promise.resolve(mutex.tail).then(fn, fn);
+    mutex.tail = task.then(() => undefined, () => undefined);
+    return await task;
+  }
+
+  return Object.freeze({
+    TRANSIENT_HTTP_STATUSES,
+    sleep,
+    clone,
+    normalizeSpace,
+    normalizeName,
+    parseHtml,
+    mapWithConcurrency,
+    readCookieValue,
+    sharedGateCookieMutex,
+    withSharedGateCookieLock
+  });
+})();
+
+/* ========================================================================
+   MODULE 2: NETWORK GATE (AURELIX_NETWORK_GATE)
+   Priority-queued concurrency limiter reserving 1 slot for combat.
+   ======================================================================== */
 /* Shared request gate: combat traffic has priority over background scanner reads. */
 const AURELIX_NETWORK_GATE = (() => {
-  const MAX_ACTIVE = 3;
-  const MAX_SCANNER_ACTIVE = 2; // reserve one slot for combat / interactive requests
+  const MAX_ACTIVE = 6;
+  const MAX_SCANNER_ACTIVE = 4; // reserve two slots for combat / interactive requests
   let active = 0, scannerActive = 0, sequence = 0;
   const queue = [];
   function pump() {
@@ -58,12 +172,16 @@ const AURELIX_NETWORK_GATE = (() => {
   return Object.freeze({ run, snapshot: () => ({ active, scannerActive, queued: queue.length, maxActive: MAX_ACTIVE }) });
 })();
 
-/* AURELIX DIAGNOSTIC v4.0 — bounded, passive, self-instrumentation. */
+/* ========================================================================
+   MODULE 3: PASSIVE DIAGNOSTICS (AURELIX_TRACE)
+   Bounded event & error ring-buffer for troubleshooting.
+   ======================================================================== */
+/* AURELIX DIAGNOSTIC v5.0 — bounded, passive, root-cause self-instrumentation. */
 const AURELIX_TRACE = (() => {
   const events = [];
-  const MAX = 350;
+  const MAX = 400;
   let seq = 0;
-  const clean = value => String(value ?? '').slice(0, 240)
+  const clean = value => String(value ?? '').slice(0, 260)
     .replace(/https?:\/\/[^\s]+/gi, m => { try { return new URL(m).pathname; } catch (_) { return '[URL]'; } })
     .replace(/(?:token|csrf|secret|password|cookie|authorization|intent|session)\s*[:=]\s*[^\s,;]+/gi, '[REDACTED]');
   function record(kind, data = {}) {
@@ -79,13 +197,232 @@ const AURELIX_TRACE = (() => {
       if (events.length > MAX) events.splice(0, events.length - MAX);
     } catch (_) {}
   }
-  function analyze() {
+  function classifyErrorCause(rawMessage, meta = {}) {
+    const msg = clean(rawMessage || meta?.error || '');
+    const status = Number(meta?.status || 0);
+    const stage = String(meta?.stage || meta?.source || '').toLowerCase();
+    const kind = String(meta?.kind || '').toLowerCase();
+
+    if (status === 429 || /429|rate\s*limit|too\s+many\s+requests/i.test(msg)) {
+      return {
+        category: 'rate-limit',
+        severity: 'warning',
+        title: 'Server Rate Limiting (HTTP 429)',
+        rootCause: 'Request frequency exceeded the game server rate-limit window.',
+        reason: `The server returned HTTP 429${meta?.path ? ` on ${meta.path}` : ''}, forcing temporary request backoff.`,
+        impact: 'Scans, combat actions, or loot claims pause briefly during Retry-After backoff.',
+        remediation: 'Keep built-in concurrency and backoff enabled; avoid running multiple overlapping tabs/scripts.'
+      };
+    }
+    if (status === 401 || status === 403 || /unauthori|forbidden|session\s+expired|not\s+logged\s+in|csrf/i.test(msg)) {
+      return {
+        category: 'auth',
+        severity: 'critical',
+        title: `Authentication / Session Rejection (${status ? `HTTP ${status}` : 'Session'})`,
+        rootCause: 'The game session cookie or CSRF/auth state is missing, expired, or rejected.',
+        reason: `Server denied access${meta?.path ? ` to ${meta.path}` : ''}: ${msg || `HTTP ${status}`}.`,
+        impact: 'Protected scanner, combat, loadout, or loot requests cannot succeed until re-authenticated.',
+        remediation: 'Reload the game page and verify you are still logged into your account.'
+      };
+    }
+    if (status >= 500 && status <= 599) {
+      return {
+        category: 'server-error',
+        severity: 'critical',
+        title: `Upstream Server Error (HTTP ${status})`,
+        rootCause: 'The game server encountered an internal error or temporary overload.',
+        reason: `Endpoint ${meta?.path || 'unknown'} responded with HTTP ${status}${msg ? ` (${msg})` : ''}.`,
+        impact: 'Affected scan, attack, or loot operation failed and must be retried.',
+        remediation: 'Wait for server stability; if persistent on a specific boss/dungeon, pause and check game status.'
+      };
+    }
+    if (status === 404 || status === 410) {
+      return {
+        category: 'stale-entity',
+        severity: 'warning',
+        title: `Target or Endpoint Not Found (HTTP ${status})`,
+        rootCause: 'The target monster, wave, or dungeon instance no longer exists or moved.',
+        reason: `Request to ${meta?.path || 'endpoint'} returned HTTP ${status}.`,
+        impact: 'That specific target/instance cannot be fetched or attacked.',
+        remediation: 'Run a fresh scan so stale entity IDs are cleared from the target list.'
+      };
+    }
+    if (/timed?\s*out|timeout|abort/i.test(msg) || kind === 'scanner-timeout-retry') {
+      return {
+        category: 'timeout',
+        severity: 'warning',
+        title: 'Network Request Timeout / Abort',
+        rootCause: 'A request did not receive a server response before the timeout deadline.',
+        reason: msg || 'Upstream server latency or local connection stall exceeded request timeout.',
+        impact: 'Current scan or combat step was delayed or retried.',
+        remediation: 'Check internet stability and inspect slowest endpoints in the trace.'
+      };
+    }
+    if (/failed\s+to\s+fetch|networkerror|network\s+error|load\s+failed|err_network/i.test(msg)) {
+      return {
+        category: 'network',
+        severity: 'critical',
+        title: 'Network Connectivity Failure',
+        rootCause: 'The browser could not complete the HTTP connection to the game server.',
+        reason: msg || 'Connection dropped, offline state, DNS failure, or browser/extension block.',
+        impact: 'Combat and scanning are paused until connectivity returns.',
+        remediation: 'Verify internet connection, VPN/proxy, and that ad/script blockers are not blocking game endpoints.'
+      };
+    }
+    if (kind === 'exception' || kind === 'unhandled-rejection') {
+      return {
+        category: 'javascript',
+        severity: 'critical',
+        title: 'Unhandled JavaScript Runtime Exception',
+        rootCause: 'An uncaught script error occurred in page or userscript execution.',
+        reason: `${msg || 'Unknown runtime error'}${meta?.source ? ` (at ${meta.source}${meta?.line ? `:${meta.line}` : ''})` : ''}.`,
+        impact: 'May interrupt UI updates or background callbacks depending on origin.',
+        remediation: 'Inspect the source file/line and stack trace; check for conflicts with other userscripts.'
+      };
+    }
+    if (/loadout|preset|equipment|pet/i.test(stage + ' ' + msg)) {
+      return {
+        category: 'loadout',
+        severity: 'warning',
+        title: 'Loadout / Preset Switch Failure',
+        rootCause: 'Equipment or pet preset verification/application did not complete cleanly.',
+        reason: msg || `Loadout step failed during ${stage || 'switch'}.`,
+        impact: 'Combat may hold or run without the intended preset.',
+        remediation: 'Verify the assigned equipment/pet preset still exists and re-capture it if needed.'
+      };
+    }
+    if (/loot|claim|dungeon_loot|loot\.php|not\s+joined|already\s+(?:looted|claimed)/i.test(msg)) {
+      return {
+        category: 'loot',
+        severity: 'warning',
+        title: 'Loot Verification or Claim Rejection',
+        rootCause: 'Monster was already looted, not joined, or server rejected the loot payload.',
+        reason: msg || 'Loot eligibility check or POST claim failed.',
+        impact: 'Candidate was skipped and placed on cooldown.',
+        remediation: 'Re-scan lootables; monsters without both "joined" and "not looted" tags cannot be claimed.'
+      };
+    }
+    if (/scanner\s+is\s+unavailable|refresh\s+target\s+data/i.test(msg) || /gate-wave|bootstrap|dungeon/i.test(stage)) {
+      return {
+        category: 'scanner',
+        severity: 'critical',
+        title: `Scanner Failure${stage ? ` (${stage})` : ''}`,
+        rootCause: 'The background scanner could not fetch or parse required game HTML.',
+        reason: msg || `Scanner stage "${stage || 'unknown'}" failed.`,
+        impact: 'Target list, HP/phase state, or wave topology may be incomplete or stale.',
+        remediation: 'Wait for the next scan cycle or reload the page if the scanner remains unavailable.'
+      };
+    }
+    if (/potion|stamina|mana|hp/i.test(msg)) {
+      return {
+        category: 'resources',
+        severity: 'warning',
+        title: 'Resource / Potion Recovery Issue',
+        rootCause: 'Player HP, Stamina, or Mana recovery could not complete as configured.',
+        reason: msg || 'Potion threshold or inventory constraint blocked recovery.',
+        impact: 'Combat may wait until resources recover.',
+        remediation: 'Check potion inventory and Potion tab thresholds.'
+      };
+    }
+    return {
+      category: 'engine',
+      severity: 'critical',
+      title: 'Engine / Runtime Error',
+      rootCause: 'An unexpected condition occurred during engine execution.',
+      reason: msg || 'No detailed message provided.',
+      impact: 'Affected action could not complete and may have paused combat.',
+      remediation: 'Review recent logs and the diagnostic timeline around this timestamp.'
+    };
+  }
+  function analyze(context = {}) {
     const findings = [];
+    const diagMap = new Map();
+    const addDiagnosis = (issue, sampleMessage, at, evidenceId = null) => {
+      const key = `${issue.category}|${issue.title}`;
+      let entry = diagMap.get(key);
+      if (!entry) {
+        entry = {
+          id: `diag-${diagMap.size + 1}`,
+          severity: issue.severity,
+          category: issue.category,
+          title: issue.title,
+          rootCause: issue.rootCause,
+          reason: issue.reason,
+          impact: issue.impact,
+          remediation: issue.remediation,
+          occurrences: 0,
+          firstSeenAt: at || null,
+          lastSeenAt: at || null,
+          sampleMessages: [],
+          evidenceIds: []
+        };
+        diagMap.set(key, entry);
+      }
+      entry.occurrences += 1;
+      if (at) {
+        if (!entry.firstSeenAt || at < entry.firstSeenAt) entry.firstSeenAt = at;
+        if (!entry.lastSeenAt || at > entry.lastSeenAt) entry.lastSeenAt = at;
+      }
+      const cleanSample = clean(sampleMessage || '');
+      if (cleanSample && !entry.sampleMessages.includes(cleanSample) && entry.sampleMessages.length < 5) {
+        entry.sampleMessages.push(cleanSample);
+      }
+      if (evidenceId != null && !entry.evidenceIds.includes(evidenceId) && entry.evidenceIds.length < 12) {
+        entry.evidenceIds.push(evidenceId);
+      }
+    };
+
     const network = events.filter(e => e.kind === 'request');
     const failures = network.filter(e => e.failed || (e.status && e.status >= 400));
     const slow = network.filter(e => e.ms >= 1800);
     const rate = failures.filter(e => e.status === 429);
     const timeouts = failures.filter(e => /timed out|abort/i.test(e.error || ''));
+    const js = events.filter(e => e.kind === 'exception' || e.kind === 'unhandled-rejection');
+    const loadoutFails = events.filter(e => e.kind === 'loadout-step' && e.ok === false);
+
+    for (const e of failures) {
+      const issue = classifyErrorCause(e.error || `HTTP ${e.status || 0}`, e);
+      addDiagnosis(issue, `${e.method || 'GET'} ${e.path || 'unknown'} -> ${e.error || `HTTP ${e.status}`}`, e.at, e.id);
+    }
+    for (const e of js) {
+      const issue = classifyErrorCause(e.message, e);
+      addDiagnosis(issue, e.message, e.at, e.id);
+    }
+    for (const e of loadoutFails) {
+      const issue = classifyErrorCause(e.error || `Loadout step ${e.step || 'unknown'} failed`, { stage: e.step, kind: 'loadout-step' });
+      addDiagnosis(issue, `${e.step || 'step'}: ${e.error || 'failed'}`, e.at, e.id);
+    }
+    if (slow.length >= 3) {
+      addDiagnosis({
+        category: 'performance',
+        severity: 'warning',
+        title: 'Elevated Server Latency',
+        rootCause: 'Multiple HTTP requests took 1.8s or longer to complete.',
+        reason: `${slow.length} slow requests observed (max ${Math.max(...slow.map(x => x.ms || 0))} ms).`,
+        impact: 'Reduces scan refresh rate and slows combat/loot cadence.',
+        remediation: 'Check slowest endpoints in the endpoint breakdown.'
+      }, `${slow.length} requests >= 1800ms`, slow[slow.length - 1]?.at, slow[slow.length - 1]?.id);
+    }
+
+    const scanErrors = Array.isArray(context?.scan?.errors) ? context.scan.errors : [];
+    for (const se of scanErrors) {
+      const msg = typeof se === 'string' ? se : (se?.message || se?.code || 'Scanner error');
+      const issue = classifyErrorCause(msg, typeof se === 'object' && se ? se : { stage: 'scanner' });
+      addDiagnosis(issue, msg, se?.at || context?.scan?.generatedAt || null);
+    }
+    if (context?.runtime?.lastError) {
+      const issue = classifyErrorCause(context.runtime.lastError, { stage: 'engine' });
+      addDiagnosis(issue, context.runtime.lastError, context.runtime.lastDecisionAt || null);
+    }
+    const logs = Array.isArray(context?.logs) ? context.logs : [];
+    for (const l of logs) {
+      const lvl = String(l?.level || l?.type || '').toLowerCase();
+      if (lvl !== 'error' && lvl !== 'warning') continue;
+      const issue = classifyErrorCause(l.message || '', { stage: lvl });
+      if (lvl === 'warning' && issue.severity === 'critical') issue.severity = 'warning';
+      addDiagnosis(issue, l.message, l.time || l.timestamp || l.at || null);
+    }
+
     const groups = {};
     for (const e of network) {
       const key = `${e.method || 'GET'} ${e.path || 'unknown'}`;
@@ -95,23 +432,62 @@ const AURELIX_TRACE = (() => {
       if (e.status) g.statuses[e.status] = (g.statuses[e.status] || 0) + 1;
     }
     const endpoints = Object.entries(groups).map(([endpoint,g]) => ({ endpoint, count:g.count, failures:g.failures, avgMs:Math.round(g.totalMs/g.count), maxMs:g.maxMs, statuses:g.statuses })).sort((a,b)=>b.failures-a.failures || b.avgMs-a.avgMs).slice(0,35);
+
+    const severityRank = { critical: 0, warning: 1, info: 2 };
+    const diagnoses = [...diagMap.values()].sort((a, b) => (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9) || b.occurrences - a.occurrences);
+
     if (rate.length) findings.push({ category:'network', cause:'HTTP 429: server rate limiting confirmed', confidence:'confirmed', evidenceIds:rate.slice(-8).map(e=>e.id), advice:'Keep server backoff; reduce request pressure or concurrency rather than disabling safeguards.' });
     if (timeouts.length) findings.push({ category:'network', cause:'Requests exceeded timeout or were aborted', confidence:'confirmed symptom; upstream cause unknown', evidenceIds:timeouts.slice(-8).map(e=>e.id), advice:'Compare endpoint latency and scheduler wait; check server availability and connection.' });
     if (slow.length) findings.push({ category:'performance', cause:'Slow network operations observed', confidence:'confirmed symptom', evidenceIds:slow.slice(-8).map(e=>e.id), advice:'Inspect the slowest endpoints and separate queue wait from request duration.' });
-    const js = events.filter(e=>e.kind==='exception' || e.kind==='unhandled-rejection');
     if (js.length) findings.push({category:'javascript',cause:'Captured runtime exception or unhandled promise rejection',confidence:'confirmed exception; origin may be another script',evidenceIds:js.slice(-8).map(e=>e.id),advice:'Inspect sanitized message, source and stack; correlate with adjacent engine events.'});
-    return { version:'4.0', mode:'passive instrumentation; no diagnostic network requests', requestGate:AURELIX_NETWORK_GATE.snapshot(), eventCount:events.length, droppedEvents:Math.max(0,seq-events.length), endpoints, findings, recentEvents:events.slice(-200) };
+
+    const criticalCount = diagnoses.filter(d => d.severity === 'critical').length;
+    const warningCount = diagnoses.filter(d => d.severity === 'warning').length;
+    const health = criticalCount > 0 ? 'CRITICAL' : (warningCount > 0 ? 'DEGRADED' : 'HEALTHY');
+    const primaryIssue = diagnoses[0] || null;
+    const headline = health === 'HEALTHY'
+      ? 'No errors or anomalies detected across scanner, network, loadouts, or combat.'
+      : `${health}: ${primaryIssue.title} — ${primaryIssue.rootCause}`;
+
+    return {
+      version: '5.0',
+      mode: 'passive instrumentation; no diagnostic network requests',
+      health,
+      headline,
+      counts: {
+        critical: criticalCount,
+        warning: warningCount,
+        networkFailures: failures.length,
+        slowRequests: slow.length,
+        jsExceptions: js.length,
+        scannerErrors: scanErrors.length,
+        loadoutFailures: loadoutFails.length
+      },
+      primaryIssue,
+      diagnoses,
+      requestGate: AURELIX_NETWORK_GATE.snapshot(),
+      eventCount: events.length,
+      droppedEvents: Math.max(0, seq - events.length),
+      endpoints,
+      findings,
+      recentEvents: events.slice(-200)
+    };
   }
   window.addEventListener('error', e => record('exception', {message:e.message || 'Script error', source:e.filename ? (()=>{try{return new URL(e.filename).pathname}catch(_){return 'unknown'}})():'unknown', line:e.lineno, column:e.colno, stack:e.error?.stack}));
   window.addEventListener('unhandledrejection', e => record('unhandled-rejection', {message:e.reason?.message || String(e.reason),stack:e.reason?.stack}));
-  return Object.freeze({record, analyze});
+  return Object.freeze({record, analyze, classifyErrorCause});
 })();
+
+/* ========================================================================
+   MODULE 4: UPDATE CHECKER (AURELIX_UPDATE)
+   GitHub release checker and userscript installer verifier.
+   ======================================================================== */
 /* =========================================================
    AURELIX UPDATE SYSTEM
    ========================================================= */
 
 const AURELIX_UPDATE = Object.freeze({
-  currentVersion: '0.7.2',
+  currentVersion: '0.7.4',
 
   releaseURL:
     'https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/release.json',
@@ -382,6 +758,11 @@ async function aurelixGetUpdateStatus(force = false) {
 
   return AURELIX_UPDATE_STATE.request;
 }
+
+/* ========================================================================
+   MODULE 5: WORLD & RESOURCE SCANNER (window.AURELIX v4.0.1)
+   Crawls Dungeons, Cube Dungeons, Gate Waves, Timer Bosses, and Inventory.
+   ======================================================================== */
 (() => {
   'use strict';
   const VERSION = '4.0.1';
@@ -389,11 +770,13 @@ async function aurelixGetUpdateStatus(force = false) {
   const CONFIG = {
     autoStart: true,
     scanIntervalMs: 10 * 60_000,
-    requestDelayMs: 25,
+    phaseWatchIntervalMs: 12_000,
+    requestDelayMs: 5,
     requestTimeoutMs: 15_000,
     scannerTimeoutRetryCount: 1,
     scannerTransientRetryCount: 2,
-    scannerWaveConcurrency: 3,
+    scannerWaveConcurrency: 5,
+    scanDeadGateWavesDuringScan: false,
     maxGatePages: 50,
     maxHubPages: 20,
     maxDungeonInstances: 10,
@@ -407,12 +790,44 @@ async function aurelixGetUpdateStatus(force = false) {
     navigationFallbackPaths: ['/guild_dungeon.php', '/'],
     resourceInventoryPaths: ['/inventory.php'],
     gatePhaseFamilies: [],
-    graktharGeneralFamilies: [],
+    graktharGeneralFamilies: [
+      {
+        key: 'grakthar-general-skarn',
+        root: 'skarn',
+        phase1Names: ['general skarn the radiant bastion'],
+        phase2Names: ['skarn, the molten general'],
+        aliases: ['general skarn the radiant bastion', 'skarn, the molten general']
+      },
+      {
+        key: 'grakthar-general-vessir',
+        root: 'vessir',
+        phase1Names: ['general vessir the sunfang duelist'],
+        phase2Names: ['vessir, the solar inferna empress'],
+        aliases: ['general vessir the sunfang duelist', 'vessir, the solar inferna empress']
+      },
+      {
+        key: 'grakthar-general-hrazz',
+        root: 'hrazz',
+        phase1Names: ['general hrazz the dawnflame oathkeeper'],
+        phase2Names: ['hrazz the dawnflame seraph'],
+        aliases: ['general hrazz the dawnflame oathkeeper', 'hrazz the dawnflame seraph']
+      },
+      {
+        key: 'grakthar-general-drakzareth',
+        root: 'drakzareth',
+        phase1Names: ['drakzareth the tyrant lizard king'],
+        phase2Names: ['drakzareth the cataclysmic half dragon king'],
+        aliases: ['drakzareth the tyrant lizard king', 'drakzareth the cataclysmic half dragon king']
+      }
+    ],
     debug: false
   };
   const state = {
     running: false,
     timer: null,
+    phaseWatchTimer: null,
+    phaseWatchInFlight: false,
+    phaseWatchTargets: [],
     inFlight: null,
     scanController: null,
     listeners: new Set(),
@@ -426,7 +841,7 @@ async function aurelixGetUpdateStatus(force = false) {
     pageCacheChars: 0,
     cacheHits: 0
   };
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const { sleep, normalizeSpace, normalizeName, parseHtml, mapWithConcurrency, readCookieValue, withSharedGateCookieLock, TRANSIENT_HTTP_STATUSES: TRANSIENT_SCAN_STATUSES } = AURELIX_SHARED;
   function log(...args) {
     if (CONFIG.debug) console.log('[AURELIX]', ...args);
   }
@@ -443,15 +858,6 @@ async function aurelixGetUpdateStatus(force = false) {
     if (typeof listener !== 'function') return () => {};
     state.listeners.add(listener);
     return () => state.listeners.delete(listener);
-  }
-  function normalizeSpace(value) {
-    return String(value ?? '').replace(/\s+/g, ' ').trim();
-  }
-  function normalizeName(value) {
-    return normalizeSpace(value)
-      .toLowerCase()
-      .replace(/[’‘]/g, "'")
-      .replace(/[“”]/g, '"');
   }
   function numberFromText(value) {
     if (value == null) return null;
@@ -547,9 +953,6 @@ async function aurelixGetUpdateStatus(force = false) {
   function textOf(el) {
     return normalizeSpace(el?.textContent || '');
   }
-  function parseHtml(html) {
-    return new DOMParser().parseFromString(html, 'text/html');
-  }
   function uniqueBy(items, keyFn) {
     const out = [];
     const seen = new Set();
@@ -560,22 +963,6 @@ async function aurelixGetUpdateStatus(force = false) {
       out.push(item);
     }
     return out;
-  }
-  async function mapWithConcurrency(items, limit, worker) {
-    const list = Array.isArray(items) ? items : [];
-    if (!list.length) return [];
-    const results = new Array(list.length);
-    let cursor = 0;
-    const workerCount = Math.max(1, Math.min(Math.floor(Number(limit) || 1), list.length));
-    const runners = Array.from({ length: workerCount }, async () => {
-      while (true) {
-        const index = cursor++;
-        if (index >= list.length) return;
-        results[index] = await worker(list[index], index);
-      }
-    });
-    await Promise.all(runners);
-    return results;
   }
   function parseHpPair(text) {
     const patterns = [
@@ -615,39 +1002,11 @@ async function aurelixGetUpdateStatus(force = false) {
         !/^join$/i.test(line)
       ) || '';
   }
-  function readCookieValue(name) {
-    const encoded = encodeURIComponent(String(name));
-    const parts = String(document.cookie || '').split(/;\s*/);
-    for (const part of parts) {
-      const eq = part.indexOf('=');
-      const rawName = eq >= 0 ? part.slice(0, eq) : part;
-      let decodedName = rawName;
-      try { decodedName = decodeURIComponent(rawName); } catch (_) {}
-      if (rawName === encoded || decodedName === String(name)) {
-        const rawValue = eq >= 0 ? part.slice(eq + 1) : '';
-        try { return decodeURIComponent(rawValue); } catch (_) { return rawValue; }
-      }
-    }
-    return null;
-  }
   function writeSessionCookie(name, value) {
     document.cookie = `${encodeURIComponent(String(name))}=${encodeURIComponent(String(value))}; Path=/; SameSite=Lax`;
   }
   function deleteCookie(name) {
     document.cookie = `${encodeURIComponent(String(name))}=; Max-Age=0; Path=/; SameSite=Lax`;
-  }
-  function sharedGateCookieMutex() {
-    const key = '__AURELIX_GATE_COOKIE_MUTEX__';
-    if (!window[key] || typeof window[key] !== 'object') {
-      window[key] = { tail: Promise.resolve() };
-    }
-    return window[key];
-  }
-  async function withSharedGateCookieLock(fn) {
-    const mutex = sharedGateCookieMutex();
-    const task = Promise.resolve(mutex.tail).then(fn, fn);
-    mutex.tail = task.then(() => undefined, () => undefined);
-    return await task;
   }
   async function withCookieOverrides(overrides, fn) {
     const entries = Object.entries(overrides || {});
@@ -717,7 +1076,6 @@ async function aurelixGetUpdateStatus(force = false) {
       }
     };
   }
-  const TRANSIENT_SCAN_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
   async function getPage(urlLike, purpose = 'scan', options = {}) {
     const url = safeUrl(urlLike);
     if (!url || !sameOrigin(url)) throw new Error(`Refusing non-same-origin URL: ${urlLike}`);
@@ -831,6 +1189,7 @@ async function aurelixGetUpdateStatus(force = false) {
     throw lastError || new Error(`Scanner request failed: ${new URL(url).pathname}`);
   }
 
+  /* --- 5.2 Dungeon & Cube Scanners --- */
   function discoverDungeonInstances(doc) {
     const found = [];
     const addInstance = (href, label = '', discoveredBy = 'navigation', fallbackId = null) => {
@@ -1281,6 +1640,7 @@ async function aurelixGetUpdateStatus(force = false) {
     dungeon.actionableNodeIds = actionable.map(n => n.nodeId);
     return { locations, entities };
   }
+  /* --- 5.3 Gate, Wave & Phase Scanners --- */
   function gateNavigationCandidates(doc) {
     const out = [];
     const add = (value, label = '', cls = '', origin = '') => {
@@ -1428,13 +1788,15 @@ async function aurelixGetUpdateStatus(force = false) {
           }
         }
         fetchedWaveDocs.set(key, page);
-        try {
-          const deadPage = await getPage(gateDeadRequestUrl(nextWave.url), `gate-wave-dead:${key}`, {
-            ttlMs: 0, populationView: 'dead-monsters'
-          });
-          fetchedDeadWaveDocs.set(key, deadPage);
-        } catch (deadError) {
-          state.errors.push({ at: nowIso(), stage: 'gate-wave-dead', key, message: String(deadError?.message || deadError) });
+        if (CONFIG.scanDeadGateWavesDuringScan) {
+          try {
+            const deadPage = await getPage(gateDeadRequestUrl(nextWave.url), `gate-wave-dead:${key}`, {
+              ttlMs: 0, populationView: 'dead-monsters'
+            });
+            fetchedDeadWaveDocs.set(key, deadPage);
+          } catch (deadError) {
+            state.errors.push({ at: nowIso(), stage: 'gate-wave-dead', key, message: String(deadError?.message || deadError) });
+          }
         }
         nextWave.gateName = gateNameFromPage(page.doc);
         nextWave.waveDisplay = gateWaveDisplayFromPage(page.doc) || nextWave.label || `Wave ${nextWave.waveId}`;
@@ -1458,17 +1820,21 @@ async function aurelixGetUpdateStatus(force = false) {
         continue;
       }
 
-      const nextHub = [...hubMap.values()].find(h => !processedHubs.has(h.url));
-      if (nextHub && processedHubs.size < CONFIG.maxHubPages) {
-        processedHubs.add(nextHub.url);
-        try {
-          const page = await getPage(nextHub.url, 'gate-hub');
-          fetchedHubDocs.set(nextHub.url, page);
-          for (const link of collectGateWaveLinks(page.doc, nextHub.url)) addWave(link);
-          for (const hub of collectSafeHubLinks(page.doc, nextHub.url)) addHub(hub);
-        } catch (e) {
-          state.errors.push({ at: nowIso(), stage: 'gate-hub', url: nextHub.url, message: String(e?.message || e) });
-        }
+      const pendingHubs = [...hubMap.values()]
+        .filter(h => !processedHubs.has(h.url))
+        .slice(0, Math.max(0, CONFIG.maxHubPages - processedHubs.size));
+      if (pendingHubs.length) {
+        await Promise.all(pendingHubs.map(async nextHub => {
+          processedHubs.add(nextHub.url);
+          try {
+            const page = await getPage(nextHub.url, 'gate-hub');
+            fetchedHubDocs.set(nextHub.url, page);
+            for (const link of collectGateWaveLinks(page.doc, nextHub.url)) addWave(link);
+            for (const hub of collectSafeHubLinks(page.doc, nextHub.url)) addHub(hub);
+          } catch (e) {
+            state.errors.push({ at: nowIso(), stage: 'gate-hub', url: nextHub.url, message: String(e?.message || e) });
+          }
+        }));
         continue;
       }
       break;
@@ -1581,17 +1947,21 @@ async function aurelixGetUpdateStatus(force = false) {
       const autoDie = normalizeSpace((text.match(/Auto-die[^\n]*/i) || [])[0] || '');
       const timerName = normalizeName(name);
       const configured = configuredGateFamilyFor(name, context.gateName);
+      const generalFamily = configuredGeneralFamilyFor(name);
       const familyKey = configured?.key || makeId('gate-timer-family', [context.gateId, context.waveId, index]);
       const aliasNames = new Set([timerName]);
       if (configured?.aliases) {
         for (const alias of configured.aliases) aliasNames.add(normalizeName(alias));
+      }
+      if (generalFamily?.aliases) {
+        for (const alias of generalFamily.aliases) aliasNames.add(normalizeName(alias));
       }
       let matches = entities.filter(e => aliasNames.has(e.normalizedName));
       if (hintedRuntimeId != null) {
         const byId = entities.find(e => e.runtimeId === hintedRuntimeId);
         if (byId && !matches.includes(byId)) matches.push(byId);
       }
-      const isGeneral = /\bgeneral\b/i.test(name);
+      const isGeneral = /\bgeneral\b/i.test(name) || !!generalFamily;
       const specialType = isGeneral ? 'grakthar-general' : 'timed-boss';
       for (const entity of matches) {
         entity.specialType = specialType;
@@ -1627,19 +1997,29 @@ async function aurelixGetUpdateStatus(force = false) {
     });
     return out;
   }
+  function classifyGraktharGeneralPhase(entity) {
+    if (!entity) return null;
+    const configured = configuredGeneralFamilyFor(entity.name);
+    const n = normalizeName(entity.name);
+    if (configured) {
+      if (Array.isArray(configured.phase2Names) && configured.phase2Names.some(a => normalizeName(a) === n)) return 2;
+      if (Array.isArray(configured.phase1Names) && configured.phase1Names.some(a => normalizeName(a) === n)) return 1;
+    }
+    if (/\b(?:molten\s+general|solar\s+inferna\s+empress|dawnflame\s+seraph|cataclysmic\s+half\s+dragon\s+king)\b/i.test(n)) return 2;
+    if (/^general\s+(?:skarn|vessir|hrazz)\b/i.test(n) || /\b(?:radiant\s+bastion|sunfang\s+duelist|dawnflame\s+oathkeeper|tyrant\s+lizard\s+king)\b/i.test(n)) return 1;
+    return null;
+  }
   function markGraktharWave3Generals(entities, context) {
     const ids = [];
     for (const entity of entities) {
-      if (entity.specialType === 'grakthar-general') {
-        ids.push(entity.entityId);
-        continue;
-      }
       const configured = configuredGeneralFamilyFor(entity.name);
-      if (!configured) continue;
-      entity.specialType = 'grakthar-general';
-      entity.phaseFamilyKey = configured.key;
-      entity.targetEligible = entity.status === 'alive';
-      ids.push(entity.entityId);
+      if (entity.specialType === 'grakthar-general' || configured) {
+        entity.specialType = 'grakthar-general';
+        if (!entity.phaseFamilyKey && configured) entity.phaseFamilyKey = configured.key;
+        entity.generalPhase = classifyGraktharGeneralPhase(entity);
+        entity.targetEligible = entity.status === 'alive';
+        ids.push(entity.entityId);
+      }
     }
     return ids;
   }
@@ -1705,7 +2085,7 @@ async function aurelixGetUpdateStatus(force = false) {
     const raw = normalizeSpace(name);
     if (!raw) return '';
     const commaHead = raw.split(',')[0];
-    const normalized = normalizeName(commaHead);
+    const normalized = normalizeName(commaHead).replace(/^general\s+/, '');
     return normalized.split(/\s+/)[0] || '';
   }
   function reconcileGatePhaseContinuations(report, previousReport) {
@@ -1750,6 +2130,9 @@ async function aurelixGetUpdateStatus(force = false) {
         entity.timerName = family.name;
         entity.classifiedByTimer = true;
         entity.targetEligible = true;
+        if (entity.specialType === 'grakthar-general') {
+          entity.generalPhase = classifyGraktharGeneralPhase(entity);
+        }
         entity.phaseContinuation = {
           recognized: true,
           reason,
@@ -1817,6 +2200,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
     }
   }
+  /* --- 5.4 Resource & Potion Scanners --- */
   function cleanPotionDisplayName(value) {
     return normalizeSpace(String(value || '')
       .replace(/\s*(?:[x×]\s*[\d,]+|\([x×]\s*[\d,]+\))\s*$/i, '')
@@ -2233,6 +2617,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
     };
   }
+  /* --- 5.5 Scan Orchestration & Public API --- */
   async function performScan() {
     state.running = true;
     emitScannerEvent('scan-start', { scanSeq: state.scanSeq + 1 });
@@ -2250,8 +2635,9 @@ async function aurelixGetUpdateStatus(force = false) {
       const gatesRootPage = gatesRootResult.status === 'fulfilled' ? gatesRootResult.value : null;
       if (!dungeonRootPage) state.errors.push({at:nowIso(),stage:'bootstrap-dungeons',message:String(dungeonRootResult.reason?.message || dungeonRootResult.reason || 'Dungeon root unavailable')});
       if (!gatesRootPage) state.errors.push({at:nowIso(),stage:'bootstrap-gates',message:String(gatesRootResult.reason?.message || gatesRootResult.reason || 'Gate root unavailable')});
-      const fallbackPages = await fetchNavigationFallbacks(gatesRootPage || dungeonRootPage || {url:location.href});
       const foregroundPage = {url:location.href,finalUrl:location.href,doc:document,status:200,ok:true};
+      const needsFallbacks = !dungeonRootPage || !gatesRootPage || discoverDungeonInstances(dungeonRootPage.doc).length === 0;
+      const fallbackPages = needsFallbacks ? await fetchNavigationFallbacks(gatesRootPage || dungeonRootPage || {url:location.href}) : [];
       const dungeonCandidates = [dungeonRootPage, ...fallbackPages, foregroundPage].filter(Boolean);
       const selectedDungeonRoot = dungeonCandidates
         .map(page => ({page, seeds:discoverDungeonInstances(page.doc).length}))
@@ -2355,6 +2741,7 @@ async function aurelixGetUpdateStatus(force = false) {
       state.lastReport = report;
       state.lastScanFinishedAt = report.generatedAt;
       emitScannerEvent('scan-complete', { scanSeq: report.scanSeq, report });
+      ensurePhaseWatch();
       console.log('[AURELIX] Scan complete', {
         seq: report.scanSeq,
         dungeons: report.dungeons.length,
@@ -2451,11 +2838,13 @@ async function aurelixGetUpdateStatus(force = false) {
           const page = await getPage(gateAliveRequestUrl(link.url), `delta-gate-wave:${key}`, { ttlMs:0, populationView:'alive-monsters' });
           const aliveWave = parseGateWave(page.doc, link, 'alive-monsters');
           let deadWave = null;
-          try {
-            const deadPage = await getPage(gateDeadRequestUrl(link.url), `delta-gate-wave-dead:${key}`, { ttlMs:0, populationView:'dead-monsters' });
-            deadWave = parseGateWave(deadPage.doc, link, 'dead-monsters');
-          } catch (deadError) {
-            state.errors.push({ at:nowIso(), stage:'delta-gate-wave-dead', url:link.url, message:String(deadError?.message || deadError) });
+          if (CONFIG.scanDeadGateWavesDuringScan) {
+            try {
+              const deadPage = await getPage(gateDeadRequestUrl(link.url), `delta-gate-wave-dead:${key}`, { ttlMs:0, populationView:'dead-monsters' });
+              deadWave = parseGateWave(deadPage.doc, link, 'dead-monsters');
+            } catch (deadError) {
+              state.errors.push({ at:nowIso(), stage:'delta-gate-wave-dead', url:link.url, message:String(deadError?.message || deadError) });
+            }
           }
           const wave = mergeGateWavePopulations(aliveWave, deadWave);
           successfulGateKeys.add(key);
@@ -2517,6 +2906,7 @@ async function aurelixGetUpdateStatus(force = false) {
       report.targets=buildTargetRegistry(report);
       state.lastReport=report; state.lastScanFinishedAt=verifiedAt;
       emitScannerEvent('scan-complete',{scanSeq:report.scanSeq,mode:'delta',report});
+      ensurePhaseWatch();
       return report;
     } finally {
       state.running=false;
@@ -2578,6 +2968,104 @@ async function aurelixGetUpdateStatus(force = false) {
       if (state.scanController === scanController) state.scanController = null;
     });
   }
+  function hasPhaseWatchWork() {
+    const reportEntities = Array.isArray(state.lastReport?.entities) ? state.lastReport.entities : [];
+    const hasPhase1General = reportEntities.some(e =>
+      e?.status === 'alive' && e?.specialType === 'grakthar-general' && Number(e?.generalPhase) === 1
+    );
+    return hasPhase1General || (Array.isArray(state.phaseWatchTargets) && state.phaseWatchTargets.length > 0);
+  }
+  function ensurePhaseWatch() {
+    if (!hasPhaseWatchWork()) {
+      if (state.phaseWatchTimer) {
+        clearInterval(state.phaseWatchTimer);
+        state.phaseWatchTimer = null;
+      }
+      return;
+    }
+    if (!state.phaseWatchTimer) {
+      state.phaseWatchTimer = setInterval(() => {
+        void runPhaseWatchTick();
+      }, CONFIG.phaseWatchIntervalMs);
+    }
+  }
+  function setPhaseWatchTargets(targets = []) {
+    const list = Array.isArray(targets) ? targets : [];
+    const seen = new Set();
+    state.phaseWatchTargets = list
+      .filter(t => t && (t.entityId || t.battleUrl))
+      .map(t => ({
+        entityId: t.entityId || null,
+        source: t.source || 'gate',
+        gateId: Number(t.gateId) || null,
+        waveId: Number(t.waveId) || null,
+        battleUrl: t.battleUrl || null,
+        phaseWatchKind: t.phaseWatchKind || (t.specialType === 'grakthar-general' ? 'grakthar-general' : 'phase-duel')
+      }))
+      .filter(t => {
+        const key = `${t.phaseWatchKind}:${t.entityId || t.battleUrl}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    ensurePhaseWatch();
+  }
+  async function runPhaseWatchTick() {
+    if (!state.lastReport || state.inFlight || state.phaseWatchInFlight) return;
+    if (!hasPhaseWatchWork()) {
+      ensurePhaseWatch();
+      return;
+    }
+    state.phaseWatchInFlight = true;
+    try {
+      const reportEntities = Array.isArray(state.lastReport.entities) ? state.lastReport.entities : [];
+      const waveSampleByKey = new Map();
+      for (const e of reportEntities) {
+        if (e?.status === 'alive' && e?.specialType === 'grakthar-general' && Number(e?.generalPhase) === 1 && e.gateId && e.waveId) {
+          const wk = `${e.gateId}:${e.waveId}`;
+          if (!waveSampleByKey.has(wk)) waveSampleByKey.set(wk, e);
+        }
+      }
+      for (const t of state.phaseWatchTargets) {
+        if (t.phaseWatchKind === 'grakthar-general' && t.gateId && t.waveId) {
+          const wk = `${t.gateId}:${t.waveId}`;
+          if (!waveSampleByKey.has(wk)) {
+            const match = reportEntities.find(e => e?.entityId === t.entityId && e?.status === 'alive');
+            if (match) waveSampleByKey.set(wk, match);
+          }
+        }
+      }
+      for (const sample of waveSampleByKey.values()) {
+        try {
+          await microRefresh(sample);
+        } catch (err) {
+          if (err?.name === 'AbortError') return;
+        }
+      }
+      const duelTargets = state.phaseWatchTargets.filter(t => t.phaseWatchKind === 'phase-duel' && t.battleUrl);
+      let phaseReadyFound = false;
+      for (const target of duelTargets) {
+        const liveEntity = reportEntities.find(e => e?.entityId === target.entityId);
+        if (!liveEntity || liveEntity.status !== 'alive' || liveEntity.phaseDuelReady) continue;
+        try {
+          const page = await getPage(target.battleUrl, `phase-watch:${target.entityId || target.battleUrl}`, { ttlMs: 0 });
+          if (page?.doc?.querySelector?.('a[href*="pvp_style_battle.php"]')) {
+            liveEntity.phaseDuelReady = true;
+            phaseReadyFound = true;
+            emitScannerEvent('phase-ready', { entityId: liveEntity.entityId, report: state.lastReport });
+          }
+        } catch (err) {
+          if (err?.name === 'AbortError') return;
+        }
+      }
+      if (phaseReadyFound) {
+        emitScannerEvent('scan-complete', { scanSeq: state.lastReport.scanSeq, mode: 'phase-watch', report: state.lastReport });
+      }
+    } finally {
+      state.phaseWatchInFlight = false;
+      ensurePhaseWatch();
+    }
+  }
   function start() {
     stop();
     const run = () => scanNow().catch(error => {
@@ -2590,6 +3078,9 @@ async function aurelixGetUpdateStatus(force = false) {
   function stop() {
     if (state.timer) clearInterval(state.timer);
     state.timer = null;
+    if (state.phaseWatchTimer) clearInterval(state.phaseWatchTimer);
+    state.phaseWatchTimer = null;
+    state.phaseWatchTargets = [];
     state.scanController?.abort(new DOMException('Scanner stopped', 'AbortError'));
   }
   function getReport() {
@@ -2667,6 +3158,7 @@ async function aurelixGetUpdateStatus(force = false) {
     scanNow,
     scanDelta: () => scanNow({ mode:'delta' }),
     microRefresh,
+    setPhaseWatchTargets,
     start,
     stop,
     subscribe,
@@ -2687,9 +3179,14 @@ async function aurelixGetUpdateStatus(force = false) {
   console.log('[AURELIX] API: AURELIX.scanNow(), .scanDelta(), .microRefresh(entity), .status(), .getDungeons(), .getDungeonLocations(), .getCubeState(), .getGateWaves(), .getReport(), .copyReport(), .start(), .stop()');
   if (CONFIG.autoStart) start();
 })();
+
+/* ========================================================================
+   MODULE 6: COMBAT & AUTOMATION ENGINE (window.AURELIX_ENGINE v0.7.4)
+   Target selection, Phases 1-3, Adaptive Slash, Skills, Loadouts, Potions & Loot.
+   ======================================================================== */
 (() => {
   'use strict';
-  const ENGINE_VERSION = '0.7.2';
+  const ENGINE_VERSION = '0.7.4';
   const ENGINE_STORE = Object.freeze({
     settings: 'aurelix_engine_settings_v030',
     targets: 'aurelix_engine_target_policy_v030',
@@ -2723,6 +3220,9 @@ async function aurelixGetUpdateStatus(force = false) {
     softOvershootPct: 0.04,
     performanceMode: 'balanced'
   });
+  const { clone, normalizeSpace, normalizeName, parseHtml: docFromHtml, mapWithConcurrency, readCookieValue, withSharedGateCookieLock: withEngineGateCookieLock, TRANSIENT_HTTP_STATUSES: TRANSIENT_SERVER_STATUSES } = AURELIX_SHARED;
+  const sleep = (ms, signal = state.abortController?.signal) => AURELIX_SHARED.sleep(ms, signal);
+  const readCookie = name => readCookieValue(name) ?? '';
   const LOOT_REJECT_COOLDOWN_MS = 120000;
   const SLASH_TIERS = Object.freeze([
     { name: 'World Breaker Slash', skillId: -5, stamina: 1000 },
@@ -2732,14 +3232,6 @@ async function aurelixGetUpdateStatus(force = false) {
     { name: 'Power Slash', skillId: -1, stamina: 10 },
     { name: 'Slash',skillId:  0, stamina: 1 }
   ]);
-  const clone = value => {
-    if (value == null) return value;
-    try { return structuredClone(value); }
-    catch (_) { return JSON.parse(JSON.stringify(value)); }
-  };
-  const normalizeSpace = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-  const normalizeName = value => normalizeSpace(value).toLowerCase()
-    .replace(/[’‘]/g, "'").replace(/[“”]/g, '"');
   function safeJsonParse(raw, fallback) {
     try {
       const parsed = JSON.parse(raw);
@@ -2824,7 +3316,7 @@ async function aurelixGetUpdateStatus(force = false) {
   function gatePhaseRootEngine(name) {
     const raw = normalizeSpace(name);
     if (!raw) return '';
-    const normalized = normalizeName(raw.split(',')[0]);
+    const normalized = normalizeName(raw.split(',')[0]).replace(/^general\s+/, '');
     return normalized.split(/\s+/)[0] || '';
   }
   function logicalTargetKey(entity) {
@@ -3170,6 +3662,7 @@ async function aurelixGetUpdateStatus(force = false) {
     if (reportToken !== ':') state.lastCatalogReportToken = reportToken;
     return Object.values(state.targetCatalog);
   }
+  /* --- 6.2 Adaptive Slash Model & Action Scheduler --- */
   class AdaptiveSlashModel {
     constructor() { this.reset(); }
     reset() {
@@ -3361,7 +3854,6 @@ async function aurelixGetUpdateStatus(force = false) {
     dungeonLootSweepPromise: null,
     lastDungeonLootSweepAt: 0,
     lastSmartLootAttemptAt: 0,
-    dungeonLootRetryAfter: 0,
     lootCandidateRejectedUntil: new Map(),
     potionUsage: {},
     encounterLedger: {},
@@ -3393,7 +3885,7 @@ async function aurelixGetUpdateStatus(force = false) {
   let unsubscribeScanner = null;
   if (window.AURELIX?.subscribe) {
     unsubscribeScanner = window.AURELIX.subscribe(event => {
-      if (event.type === 'scan-complete') {
+      if (event.type === 'scan-complete' || event.type === 'phase-ready') {
         if (state.status !== ENGINE_STATES.RUNNING && Object.keys(state.skillCatalog).length === 0) {
           void refreshActiveSkills(true);
         }
@@ -3828,6 +4320,7 @@ async function aurelixGetUpdateStatus(force = false) {
     emit();
     return saved !== false;
   }
+  /* --- 6.3 Target Scoring, Phases & Decision Planner --- */
   function sourceAllowed(entity) {
     if (state.settings.mode === 'full') return true;
     return entity.source === state.settings.mode;
@@ -3941,9 +4434,19 @@ async function aurelixGetUpdateStatus(force = false) {
     if (changed) savePhaseRuntime(state.phaseProgress);
     return target;
   }
+  function graktharGeneralPhaseFromEntity(entity) {
+    if (!entity) return null;
+    if (Number(entity.generalPhase) === 1 || Number(entity.generalPhase) === 2) return Number(entity.generalPhase);
+    const n = normalizeName(entity.name);
+    if (/\b(?:molten\s+general|solar\s+inferna\s+empress|dawnflame\s+seraph|cataclysmic\s+half\s+dragon\s+king)\b/i.test(n)) return 2;
+    if (/^general\s+(?:skarn|vessir|hrazz)\b/i.test(n) || /\b(?:radiant\s+bastion|sunfang\s+duelist|dawnflame\s+oathkeeper|tyrant\s+lizard\s+king)\b/i.test(n)) return 1;
+    return null;
+  }
   function buildCandidates(report) {
     const entities = Array.isArray(report?.entities) ? report.entities : [];
     const candidates = [];
+    const phase1Generals = [];
+    const phaseWaitingTargets = [];
     const seenRuntimeEncounters = new Set();
     for (const entity of entities) {
       if (entity?.status !== 'alive') continue;
@@ -3992,6 +4495,10 @@ async function aurelixGetUpdateStatus(force = false) {
       if (!policy?.enabled) continue;
       const phaseLimits = phasePolicyLimits(policy, entity.name, policyKey);
       if (!(phaseLimits.phase1 > 0 || phaseLimits.phase3 > 0)) continue;
+      if (entity.specialType === 'grakthar-general' && graktharGeneralPhaseFromEntity(entity) === 1) {
+        phase1Generals.push(entity);
+        continue;
+      }
       const encounterKey = runtimeEncounterKey(entity);
       const deadUntil = Number(state.deadCombatTargetsUntil.get(encounterKey)) || 0;
       if (deadUntil > Date.now()) continue;
@@ -4012,6 +4519,10 @@ async function aurelixGetUpdateStatus(force = false) {
         : phaseLimits.phase1;
       const phaseWaiting = !inPhase3 && phaseLimits.phase3 > 0 && (!(phaseLimits.phase1 > 0) || (damageKnown && userDamage >= phaseLimits.phase1));
       if (!phaseWaiting && damageKnown && userDamage >= damageLimit) continue;
+      if (phaseWaiting && !entity.phaseDuelReady) {
+        phaseWaitingTargets.push({ ...entity, logicalKey, policyKey, phaseWatchKind: 'phase-duel' });
+        continue;
+      }
       if (phaseWaiting && Number(state.phaseDeferredUntil[phaseProgressKey({ ...entity, logicalKey, policyKey })] || 0) > Date.now()) continue;
       if (inPhase3 && !(phaseLimits.phase3 > 0)) continue;
       const loadoutAssignment = assignmentForTarget(entity, policyKey);
@@ -4040,6 +4551,12 @@ async function aurelixGetUpdateStatus(force = false) {
       if (aReady !== bReady) return bReady - aReady;
       return compareCandidates(a, b);
     });
+    state.phase1WaitingGenerals = phase1Generals;
+    state.phaseWaitingTargets = phaseWaitingTargets;
+    window.AURELIX?.setPhaseWatchTargets?.([
+      ...phase1Generals.map(g => ({ ...g, phaseWatchKind: 'grakthar-general' })),
+      ...phaseWaitingTargets
+    ]);
     return candidates;
   }
   const PIPELINE_KEYS = ['scan','decide','loadout','resource','attack','verify'];
@@ -4117,12 +4634,15 @@ async function aurelixGetUpdateStatus(force = false) {
     state.lastReportGeneratedAt = report.generatedAt ?? null;
     updateTargetCatalog(report);
     const candidates = buildCandidates(report);
-    const selected = candidates.find(c => !c.phaseWaiting) || candidates.find(c => c.phaseWaiting) || null;
+    const selected = candidates.find(c => !c.phaseWaiting || c.phaseDuelReady) || null;
     const previousEntityId = state.currentTarget?.entityId || null;
     state.currentTarget = selected ? clone(selected) : null;
     if (!selected && state.status === ENGINE_STATES.RUNNING && Date.now() - Number(state.lastIdleTargetLogAt || 0) >= 30_000) {
       state.lastIdleTargetLogAt = Date.now();
-      pushLog('phase', 'Waiting for active target. Other queued monsters will be processed as soon as they become eligible.');
+      const watchingPhase = (state.phase1WaitingGenerals?.length || 0) > 0 || (state.phaseWaitingTargets?.length || 0) > 0;
+      pushLog('phase', watchingPhase
+        ? 'Waiting for Phase 2 to start (scanner is watching in background).'
+        : 'Waiting for active target. Other queued monsters will be processed as soon as they become eligible.');
     }
     state.currentPlan = selected ? makePlan(selected) : {
       type: 'idle',
@@ -4168,29 +4688,6 @@ async function aurelixGetUpdateStatus(force = false) {
       return null;
     }
   }
-  const sleep = (ms, signal = state.abortController?.signal) => new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
-    let settled = false;
-    let timer = null;
-    const cleanup = () => {
-      if (signal) signal.removeEventListener('abort', onAbort);
-    };
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve();
-    };
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      cleanup();
-      reject(new DOMException('Aborted', 'AbortError'));
-    };
-    timer = setTimeout(finish, Math.max(0, Number(ms) || 0));
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
-  });
   function runtimeEncounterKey(entity) {
     if (!entity) return 'unknown';
     if (entity.source === 'dungeon') {
@@ -4222,20 +4719,12 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     return state.encounterLedger[key].damage;
   }
-  function readCookie(name) {
-    const prefix = `${encodeURIComponent(name)}=`;
-    const part = String(document.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(prefix));
-    if (!part) return '';
-    const value = part.slice(prefix.length);
-    try { return decodeURIComponent(value); } catch (_) { return value; }
-  }
   function parseNumber(value) {
     const match = String(value ?? '').replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
     if (!match) return null;
     const n = Number(match[0]);
     return Number.isFinite(n) ? n : null;
   }
-  const TRANSIENT_SERVER_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
   function isTransientServerStatus(status) {
     return TRANSIENT_SERVER_STATUSES.has(Number(status));
   }
@@ -4358,6 +4847,7 @@ async function aurelixGetUpdateStatus(force = false) {
       }
     }, {priority,mutation:method !== 'GET',dedupeKey});
   }
+  /* --- 6.4 Loadouts, Slot-Bound Crystals & Pet Formations --- */
   const LOADOUT_LEGACY = Object.freeze({
     equipment: 'veyra_equipment_crystal_quicksets_v1',
     pets: 'cosmic_quick_pet_presets_v1'
@@ -4659,11 +5149,12 @@ async function aurelixGetUpdateStatus(force = false) {
       : normalizeAssetPath(desired.image) === normalizeAssetPath(live.image);
   }
   function equipmentPresetMatches(preset, current) {
+    // Power Crystals are now bound to equipment slots, not individual items.
+    // Presets verify gear identity only; crystals must remain untouched on gear swaps.
     const desired = preset?.equipment || {}, a = Object.keys(desired), b = Object.keys(current || {});
     return a.length === b.length && a.every(slot => {
       const live = current[slot];
-      if (!live) return false;
-      return equipmentItemMatches(desired[slot], live) && crystalIds(desired[slot].crystals) === crystalIds(live.crystals);
+      return !!live && equipmentItemMatches(desired[slot], live);
     });
   }
   async function captureEquipmentPreset(name, { persist = true } = {}) {
@@ -4715,110 +5206,17 @@ async function aurelixGetUpdateStatus(force = false) {
     return clone(preset);
   }
   async function equipmentPost(data) { return loadoutRequest('/inventory_ajax.php', { method:'POST', params:data, expect:'text' }); }
-  function readCrystalIntent(doc) {
-    return doc?.querySelector('#equipCrystalForm input[name="crystal_intent"], #unequipCrystalForm input[name="crystal_intent"], input[name="crystal_intent"]')?.value?.trim() || '';
-  }
-  function crystalLocationsFromDocument(doc) {
-    const locations = new Map();
-    for (const card of parseCrystalEquipment(doc)) {
-      for (const crystal of card.crystals || []) locations.set(String(crystal.id), {
-        invId:card.equipmentInvId ? String(card.equipmentInvId) : null,
-        image:normalizeAssetPath(card.image)
-      });
-    }
-    return locations;
-  }
-  function crystalLocationMatchesItem(location, item) {
-    return !!location && (
-      (location.invId && String(location.invId) === String(item?.invId || ''))
-      || (!location.invId && location.image === normalizeAssetPath(item?.image))
-    );
-  }
-  async function mutateCrystalSafely(data, verify, label, crystalSession = null) {
-    let lastError = '';
-    for (let attempt=0; attempt<2; attempt++) {
-      try {
-        let page, token;
-        const cached = crystalSession?.nextPage;
-        crystalSession && (crystalSession.nextPage = null); // consume once, even on failure
-        if (cached?.doc && cached.token && cached.token !== cached.usedToken) {
-          page = cached.doc;
-          token = cached.token;
-        } else {
-          page = docFromHtml(await loadoutRequest('/power_crystals.php', { expect:'text' }));
-          token = readCrystalIntent(page);
-        }
-        if (!token) throw new Error('Power Crystals page did not provide a fresh crystal_intent.');
-        if (verify(page)) {
-          if (crystalSession) crystalSession.nextPage = { doc:page, token, usedToken:'' };
-          return page;
-        }
-        const body = new URLSearchParams({ crystal_intent:token });
-        Object.entries(data).forEach(([key,value]) => body.set(key, String(value)));
-        const { res, text } = await fetchText('/power_crystals.php', {
-          method:'POST',
-          headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
-          body:body.toString(),
-          signal:loadoutSignal(), timeoutMs:8_000, safeRetries:0
-        });
-        if (res.ok) {
-          const resultDoc = docFromHtml(text);
-          if (verify(resultDoc)) {
-            const nextToken = readCrystalIntent(resultDoc);
-            if (crystalSession && nextToken && nextToken !== token) {
-              crystalSession.nextPage = { doc:resultDoc, token:nextToken, usedToken:token };
-            }
-            return resultDoc;
-          }
-          lastError = `${label}: resulting crystal page did not confirm the change`;
-        } else lastError = `${label}: HTTP ${res.status}`;
-      } catch (error) {
-        if (error?.name === 'AbortError') throw error;
-        lastError = error?.message || String(error);
-      }
-      try {
-        const authoritative = docFromHtml(await loadoutRequest('/power_crystals.php', { expect:'text' }));
-        if (verify(authoritative)) {
-          const freshToken = readCrystalIntent(authoritative);
-          if (crystalSession && freshToken) crystalSession.nextPage = { doc:authoritative, token:freshToken, usedToken:'' };
-          return authoritative;
-        }
-      } catch (error) {
-        if (error?.name === 'AbortError') throw error;
-        lastError += ` | verification: ${error?.message || error}`;
-      }
-    }
-    throw new Error(`${label} failed after safe verification: ${lastError}`);
-  }
   async function applyEquipmentPreset(preset, initialCurrent = null, { verify = true } = {}) {
     if (!normalizeEquipmentPreset(preset)) throw new Error('Invalid PvE equipment preset.');
     const current = initialCurrent || await fetchEquipmentSnapshot();
     if (equipmentPresetMatches(preset, current)) return 0;
+
     const desired = preset.equipment || {};
-    const cards = current._crystalCards || [];
-    const currentCrystalLocation = new Map();
-    for (const card of cards) for (const crystal of card.crystals) currentCrystalLocation.set(String(crystal.id), { invId:card.equipmentInvId ? String(card.equipmentInvId) : null, image:card.image });
     let changed = 0;
-    const initialCrystalPage = current._crystalInitialPage;
-    const initialCrystalToken = initialCrystalPage?.doc && readCrystalIntent(initialCrystalPage.doc);
-    const crystalSession = { nextPage: initialCrystalToken
-      && Date.now() - Number(initialCrystalPage.checkedAt || 0) < 5_000
-      ? {doc:initialCrystalPage.doc, token:initialCrystalToken, usedToken:''}
-      : null };
-    for (const item of Object.values(desired)) for (const crystal of item.crystals || []) {
-      const location = currentCrystalLocation.get(String(crystal.id));
-      const correct = location && ((location.invId && location.invId === String(item.invId)) || (!location.invId && location.image === normalizeAssetPath(item.image)));
-      if (!location || correct) continue;
-      const resultDoc = await axLoadoutTimed('crystal-unlink', () => mutateCrystalSafely(
-        { action:'unequip_crystal', crystal_id:crystal.id },
-        doc => !crystalLocationsFromDocument(doc).has(String(crystal.id)),
-        `Unlink crystal ${crystal.id}`, crystalSession
-      ));
-      currentCrystalLocation.clear();
-      for (const [id,loc] of crystalLocationsFromDocument(resultDoc)) currentCrystalLocation.set(id,loc);
-      changed++;
-    }
-    crystalSession.nextPage = null; // equipment changes invalidate cached crystal-page state
+
+    // IMPORTANT: crystals are slot-bound in the updated game logic. Do not unlink
+    // crystals before changing gear and do not relink them to inventory item IDs.
+    // Swapping equipment should leave every crystal slot exactly as it is.
     for (const slot of Object.keys(LOADOUT_SLOTS)) {
       const wanted = desired[slot];
       if (!wanted || equipmentItemMatches(wanted, current[slot])) continue;
@@ -4827,24 +5225,17 @@ async function aurelixGetUpdateStatus(force = false) {
         if (String(result).trim() !== 'OK') throw new Error(`Unequip ${slot}: ${String(result).trim()}`);
         changed++;
       }
-      const result = await equipmentPost({ action:'equip_item', inv_id:wanted.invId, slot_id:(slot === 'ring1' || slot === 'ring2') ? LOADOUT_SLOTS[slot] : 0, set:'attack' });
+      const result = await equipmentPost({
+        action:'equip_item', inv_id:wanted.invId,
+        slot_id:(slot === 'ring1' || slot === 'ring2') ? LOADOUT_SLOTS[slot] : 0,
+        set:'attack'
+      });
       if (String(result).trim() !== 'OK') throw new Error(`Equip ${wanted.name}: ${String(result).trim()}`);
       changed++;
     }
-    for (const item of Object.values(desired)) for (const crystal of item.crystals || []) {
-      const location = currentCrystalLocation.get(String(crystal.id));
-      const correct = location && ((location.invId && location.invId === String(item.invId)) || (!location.invId && location.image === normalizeAssetPath(item.image)));
-      if (correct) continue;
-      const resultDoc = await axLoadoutTimed('crystal-link', () => mutateCrystalSafely(
-        { action:'equip_crystal', crystal_id:crystal.id, equipment_inv_id:item.invId },
-        doc => crystalLocationMatchesItem(crystalLocationsFromDocument(doc).get(String(crystal.id)), item),
-        `Link crystal ${crystal.id}`, crystalSession
-      ));
-      currentCrystalLocation.clear();
-      for (const [id,loc] of crystalLocationsFromDocument(resultDoc)) currentCrystalLocation.set(id,loc);
-      changed++;
+    if (verify && !equipmentPresetMatches(preset, await fetchEquipmentSnapshot())) {
+      throw new Error('Equipment verification failed.');
     }
-    if (verify && !equipmentPresetMatches(preset, await fetchEquipmentSnapshot())) throw new Error('Equipment and crystal verification failed.');
     return changed;
   }
   function emptyPetAttachments() {
@@ -5486,9 +5877,7 @@ async function aurelixGetUpdateStatus(force = false) {
     };
   }
   syncLegacyPresets();
-  function docFromHtml(html) {
-    return new DOMParser().parseFromString(String(html || ''), 'text/html');
-  }
+  /* --- 6.5 Active Skills, Buff Relay & Battle Snapshots --- */
   function battleUrlFor(target) {
     if (target?.battleUrl) return new URL(target.battleUrl, location.origin).href;
     if (target?.source === 'dungeon') {
@@ -6068,12 +6457,19 @@ async function aurelixGetUpdateStatus(force = false) {
     const cfg = parseBattleCfg(doc);
     updateSkillCatalogFromDocument(doc);
     const identityOk = validateBattleIdentity(target, cfg);
+    const isGoldMode = !!doc.querySelector('.monster-hp-wrap--gold');
+    const hasPhaseAnnounce = !!doc.querySelector('.phase-announce');
+    const battleCardTitle = normalizeName(doc.querySelector('.card-title')?.textContent || '');
+    const generalPhase = target?.specialType === 'grakthar-general'
+      ? (isGoldMode || hasPhaseAnnounce || /\b(?:molten\s+general|solar\s+inferna\s+empress|dawnflame\s+seraph|cataclysmic\s+half\s+dragon\s+king)\b/i.test(battleCardTitle) ? 2 : 1)
+      : null;
     const snapshot = {
       ok: true,
       url: res.url || url,
       doc,
       cfg,
       identityOk,
+      generalPhase,
       userId: parseUserId(doc),
       userDamage: parseYourDamage(doc),
       image: parseBattleMonsterImage(doc),
@@ -6274,6 +6670,7 @@ async function aurelixGetUpdateStatus(force = false) {
     if (Number.isFinite(ledger) && ledger >= 0) damage = damage == null ? ledger : Math.max(damage, ledger);
     return damage;
   }
+  /* --- 6.6 Resources, Potions & Gate/Wave & Dungeon Auto-Loot --- */
   function currentStamina() {
     const live = nullableNumber(state.liveResources.stamina);
     if (live != null && live >= 0) return live;
@@ -6648,6 +7045,8 @@ async function aurelixGetUpdateStatus(force = false) {
     if (String(card.dataset?.dead || '') === '1' || card.classList?.contains('dead')) return true;
     const text = normalizeSpace(card.textContent || '');
     const hp = parseResourcePair(text);
+    if (hp && hp.current > 0) return false;
+    if (card.closest?.('[data-dead="1"],.dead-monsters,#dead-monsters,.dead-list')) return true;
     return /\bdead\b|\bnot\s+looted\b|\bunclaimed\b/i.test(text) || (hp && hp.current <= 0);
   }
   function lootCardLooksUnclaimed(card) {
@@ -6663,21 +7062,6 @@ async function aurelixGetUpdateStatus(force = false) {
     return value || 'Monster';
   }
   
-  async function mapWithConcurrency(items, limit, worker) {
-    const list = Array.isArray(items) ? items : [];
-    if (!list.length) return [];
-    const results = new Array(list.length);
-    let cursor = 0;
-    const runners = Array.from({ length: Math.max(1, Math.min(Number(limit) || 1, list.length)) }, async () => {
-      while (true) {
-        const index = cursor++;
-        if (index >= list.length) return;
-        results[index] = await worker(list[index], index);
-      }
-    });
-    await Promise.all(runners);
-    return results;
-  }
   const DUNGEON_BATTLE_INDEX_KEY = 'aurelix_dungeon_battle_index_v1';
   const DUNGEON_BATTLE_INDEX_AGE_MS = 90 * 86400000;
   function dungeonBattleIndexRead() {
@@ -6697,6 +7081,230 @@ async function aurelixGetUpdateStatus(force = false) {
   function dungeonBattleIndexForget(key) {
     const rows = dungeonBattleIndexRead().filter(row => row.key !== key);
     saveObject(DUNGEON_BATTLE_INDEX_KEY, rows);
+  }
+  function extractClosedDungeonJsonConst(doc, constName) {
+    for (const script of [...(doc?.scripts || [])]) {
+      if (script.src) continue;
+      const text = script.textContent || '';
+      const marker = `const ${constName} = `;
+      const start = text.indexOf(marker);
+      if (start < 0) continue;
+      let i = start + marker.length;
+      while (/\s/.test(text[i] || '')) i++;
+      const opener = text[i];
+      if (opener !== '{' && opener !== '[') continue;
+      const closer = opener === '{' ? '}' : ']';
+      let depth = 0, inString = false, escaped = false;
+      for (let j = i; j < text.length; j++) {
+        const ch = text[j];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === opener) depth++;
+        else if (ch === closer) {
+          depth--;
+          if (depth === 0) {
+            try { return JSON.parse(text.slice(i, j + 1)); } catch (_) { break; }
+          }
+        }
+      }
+    }
+    return null;
+  }
+  function parseClosedDungeonCards(doc) {
+    const instances = [];
+    const seen = new Set();
+    const safeOriginUrl = (href, base = location.origin) => {
+      try {
+        const u = new URL(String(href || '').replace(/&amp;/gi, '&').trim(), base);
+        return u.origin === location.origin ? u.href : null;
+      } catch (_) { return null; }
+    };
+    const intQueryParam = (href, key) => {
+      try {
+        const u = new URL(String(href || ''), location.origin);
+        const n = Number(u.searchParams.get(key));
+        return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+      } catch (_) { return null; }
+    };
+    for (const grid of doc?.querySelectorAll?.('.grid.ended') || []) {
+      for (const card of grid.querySelectorAll('.card')) {
+        const viewLink = [...card.querySelectorAll('a[href*="guild_dungeon_enter.php"]')].find(a =>
+          /\bview\b/i.test(normalizeSpace(a.textContent || ''))
+        ) || card.querySelector('a[href*="guild_dungeon_enter.php"]');
+        const entryUrl = safeOriginUrl(viewLink?.getAttribute('href') || '');
+        const tags = [...card.querySelectorAll('.tag')].map(t => normalizeSpace(t.textContent || ''));
+        const instanceTag = tags.find(t => /^Instance\s*#\d+/i.test(t)) || '';
+        const instanceId = intQueryParam(entryUrl, 'id') ?? intQueryParam(entryUrl, 'instance_id') ??
+          (instanceTag.match(/(\d+)/) ? Number(instanceTag.match(/(\d+)/)[1]) : null);
+        if (!instanceId || !entryUrl || seen.has(instanceId)) continue;
+        const statusTag = tags.find(t => /^Status:\s*/i.test(t)) || '';
+        const statusMatch = statusTag.match(/^Status:\s*(.+)$/i);
+        const status = normalizeName(statusMatch ? statusMatch[1] : '');
+        if (status !== 'ended' && status !== 'failed' && status !== 'closed' && status !== 'completed') continue;
+        const name = normalizeSpace(card.querySelector('.h')?.textContent || '') || `Dungeon #${instanceId}`;
+        seen.add(instanceId);
+        instances.push({ instanceId, name, status, entryUrl });
+      }
+    }
+    return instances.slice(0, 30);
+  }
+  function collectClosedDungeonLocationRefs(doc, pageUrl, instanceId) {
+    const safeOriginUrl = (href, base = pageUrl) => {
+      try {
+        const u = new URL(String(href || '').replace(/&amp;/gi, '&').trim(), base);
+        return u.origin === location.origin ? u.href : null;
+      } catch (_) { return null; }
+    };
+    const intQueryParam = (href, key) => {
+      try {
+        const u = new URL(String(href || ''), location.origin);
+        const n = Number(u.searchParams.get(key));
+        return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+      } catch (_) { return null; }
+    };
+    const cubeState = extractClosedDungeonJsonConst(doc, 'STATE');
+    if (cubeState && Array.isArray(cubeState.nodes)) {
+      const byId = new Map();
+      for (const node of cubeState.nodes) {
+        const locationId = Number(node?.linked_location_id);
+        if (!(locationId > 0) || !Number(node?.is_revealed)) continue;
+        if (!byId.has(locationId)) {
+          const url = safeOriginUrl(`/guild_dungeon_location.php?instance_id=${instanceId}&location_id=${locationId}`, location.origin);
+          if (url) byId.set(locationId, { instanceId, locationId, name: normalizeSpace(node?.name || '') || `Location ${locationId}`, url });
+        }
+      }
+      return [...byId.values()].sort((a, b) => a.locationId - b.locationId);
+    }
+    const byId = new Map();
+    const add = (href, label = '') => {
+      const url = safeOriginUrl(href, pageUrl);
+      if (!url || !/guild_dungeon_location\.php/i.test(url)) return;
+      const hrefInstance = intQueryParam(url, 'instance_id');
+      if (hrefInstance != null && Number(hrefInstance) !== Number(instanceId)) return;
+      const locationId = intQueryParam(url, 'location_id');
+      if (!locationId || byId.has(locationId)) return;
+      byId.set(locationId, { instanceId, locationId, name: normalizeSpace(label) || `Location ${locationId}`, url });
+    };
+    for (const el of doc?.querySelectorAll?.('a[href*="guild_dungeon_location.php"], [data-href*="guild_dungeon_location.php"], [data-url*="guild_dungeon_location.php"]') || []) {
+      const href = el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('data-url') || '';
+      const card = el.closest('.pin,.location-card,.room-card,.card,li,tr,section,article');
+      const label = card?.querySelector?.('h1,h2,h3,h4,.name,.title')?.textContent || el.textContent || '';
+      add(href, label);
+    }
+    const html = doc?.documentElement?.innerHTML || '';
+    const re = /(?:https?:\/\/[^\s'"<>]+)?\/?guild_dungeon_location\.php\?[^\s'"<>)]*location_id=\d+[^\s'"<>)]*/gi;
+    let m;
+    while ((m = re.exec(html))) add(m[0], '');
+    return [...byId.values()].sort((a, b) => a.locationId - b.locationId);
+  }
+  function extractClosedDungeonMonsterName(card, dgmid) {
+    const explicit = normalizeSpace(card?.dataset?.name || '');
+    if (explicit) return explicit;
+    const namedEl = card?.querySelector?.('.monster-name,.mon-name,.name,h1,h2,h3,h4,h5');
+    if (namedEl) {
+      const text = normalizeSpace(namedEl.textContent || '');
+      if (text) return text;
+    }
+    const headerEl = card?.querySelector?.('div[style*="font-weight"]') || card;
+    if (headerEl?.childNodes) {
+      const directText = [...headerEl.childNodes]
+        .filter(node => node.nodeType === 3)
+        .map(node => normalizeSpace(node.textContent || ''))
+        .filter(Boolean)
+        .join(' ');
+      if (directText) return directText;
+    }
+    return `Monster #${dgmid}`;
+  }
+  function parseClosedDungeonLootCandidates(doc, dungeon, loc) {
+    const cards = [...(doc?.querySelectorAll?.('.mon,.monster-card,[data-dgmid],[data-monster-id]') || [])]
+      .filter((card, index, all) => !all.some((other, otherIndex) => otherIndex < index && other.contains(card)));
+    const out = [];
+    for (const card of cards) {
+      const text = normalizeSpace(card.textContent || '');
+      const fightLink = card.querySelector('a[href*="battle.php"]');
+      let battleUrl = null;
+      let dgmid = Number(card.dataset?.dgmid) > 0 ? Number(card.dataset.dgmid) : null;
+      try {
+        const rawHref = fightLink?.getAttribute('href') || '';
+        if (rawHref) {
+          const u = new URL(rawHref.replace(/&amp;/gi, '&'), location.origin);
+          if (u.origin === location.origin) {
+            battleUrl = u.href;
+            const paramId = Number(u.searchParams.get('dgmid'));
+            if (paramId > 0) dgmid = paramId;
+          }
+        }
+      } catch (_) {}
+      if (!dgmid || !battleUrl) continue;
+      const pills = [...card.querySelectorAll('.pill')].map(p => normalizeName(p.textContent || ''));
+      const notJoined = String(card.dataset?.unjoined || '') === '1' || pills.includes('not joined') ||
+        (/\bnot\s+joined\b/i.test(text) && !/\bjoined\b/i.test(text.replace(/\bnot\s+joined\b/ig, '')));
+      const joined = String(card.dataset?.joined || '') === '1' || pills.includes('joined') || (!notJoined && /\bjoined\b/i.test(text));
+      const hasNotLootedTag = pills.includes('not looted') || pills.includes('unclaimed') || /\bnot\s+looted\b|\bunclaimed\b/i.test(text);
+      const hasLootedTag = String(card.dataset?.looted || '') === '1' || String(card.dataset?.claimed || '') === '1' ||
+        pills.includes('looted') || pills.includes('claimed') || (/\balready\s+looted\b|\blooted\b|\bclaimed\b/i.test(text) && !hasNotLootedTag);
+      if (!joined || notJoined || !hasNotLootedTag || hasLootedTag) continue;
+      out.push({
+        source: 'dungeon',
+        name: extractClosedDungeonMonsterName(card, dgmid),
+        dungeonName: dungeon.name,
+        instanceId: dungeon.instanceId,
+        locationId: loc.locationId,
+        locationName: loc.name,
+        dgmid,
+        battleUrl,
+        key: `dungeon:${dungeon.instanceId}:${dgmid}`
+      });
+    }
+    return out;
+  }
+  async function discoverClosedDungeonLootCandidates({ allowWhenStopped = false } = {}) {
+    if (!allowWhenStopped && state.status !== ENGINE_STATES.RUNNING) return [];
+    const seen = new Set();
+    const out = [];
+    try {
+      const { res, text } = await fetchText('/guild_dungeon.php', { signal: state.abortController?.signal });
+      if (!res.ok) return out;
+      const rootDoc = docFromHtml(text);
+      updateLiveResourcesFromDocument(rootDoc);
+      const closedDungeons = parseClosedDungeonCards(rootDoc);
+      await mapWithConcurrency(closedDungeons, 3, async dungeon => {
+        if (!allowWhenStopped && state.status !== ENGINE_STATES.RUNNING) return;
+        try {
+          const instResp = await fetchText(dungeon.entryUrl, { signal: state.abortController?.signal });
+          if (!instResp.res.ok) return;
+          const instDoc = docFromHtml(instResp.text);
+          const refs = collectClosedDungeonLocationRefs(instDoc, instResp.res.url || dungeon.entryUrl, dungeon.instanceId);
+          await mapWithConcurrency(refs, 5, async loc => {
+            if (!allowWhenStopped && state.status !== ENGINE_STATES.RUNNING) return;
+            try {
+              const locResp = await fetchText(loc.url, { signal: state.abortController?.signal });
+              if (!locResp.res.ok) return;
+              const locDoc = docFromHtml(locResp.text);
+              for (const candidate of parseClosedDungeonLootCandidates(locDoc, dungeon, loc)) {
+                if (seen.has(candidate.key)) continue;
+                seen.add(candidate.key);
+                out.push(candidate);
+              }
+            } catch (err) {
+              if (err?.name === 'AbortError') throw err;
+            }
+          });
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+        }
+      });
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      pushLog('warning', `AUTO LOOT — Closed dungeon loot discovery failed: ${error?.message || error}`);
+    }
+    return out;
   }
   
   function deadLootMaxPages(doc) {
@@ -6738,19 +7346,6 @@ async function aurelixGetUpdateStatus(force = false) {
       key: `gate:${monsterId}`
     };
   }
-  function engineSharedGateCookieMutex() {
-    const key = '__AURELIX_GATE_COOKIE_MUTEX__';
-    if (!window[key] || typeof window[key] !== 'object') {
-      window[key] = { tail: Promise.resolve() };
-    }
-    return window[key];
-  }
-  async function withEngineGateCookieLock(fn) {
-    const mutex = engineSharedGateCookieMutex();
-    const task = Promise.resolve(mutex.tail).then(fn, fn);
-    mutex.tail = task.then(() => undefined, () => undefined);
-    return await task;
-  }
   async function withGateDeadViewRequest(requestFn) {
     if (typeof requestFn !== 'function') throw new TypeError('withGateDeadViewRequest requires a request function.');
     return await withEngineGateCookieLock(async () => {
@@ -6773,48 +7368,96 @@ async function aurelixGetUpdateStatus(force = false) {
       }
     });
   }
-  async function discoverGateLootCandidates() {
+  async function discoverFallbackGateWaves() {
+    const waveMap = new Map();
+    const addWaveFromUrl = rawHref => {
+      if (!rawHref) return;
+      try {
+        const u = new URL(rawHref, location.origin);
+        if (u.origin !== location.origin || !/active_wave\.php$/i.test(u.pathname)) return;
+        const gateId = parseNumber(u.searchParams.get('gate'));
+        const waveId = parseNumber(u.searchParams.get('wave'));
+        if (!(gateId > 0) || !(waveId > 0)) return;
+        u.searchParams.delete('dead_page');
+        const key = `${gateId}:${waveId}`;
+        if (!waveMap.has(key)) waveMap.set(key, { gateId, waveId, url: u.href });
+      } catch (_) {}
+    };
+    for (const a of document.querySelectorAll('a[href*="active_wave.php"]')) {
+      addWaveFromUrl(a.getAttribute('href'));
+    }
+    try {
+      const { res, text } = await fetchText('/gates.php', { signal: state.abortController?.signal });
+      if (res.ok) {
+        const doc = docFromHtml(text);
+        updateLiveResourcesFromDocument(doc);
+        for (const a of doc.querySelectorAll('a[href*="active_wave.php"]')) {
+          addWaveFromUrl(a.getAttribute('href'));
+        }
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+    }
+    for (const waveId of [9, 10, 11, 12, 13, 14, 15, 16, 17]) {
+      addWaveFromUrl(`/active_wave.php?gate=5&wave=${waveId}`);
+    }
+    return [...waveMap.values()];
+  }
+  async function discoverGateLootCandidates({ allowWhenStopped = false } = {}) {
     const report = window.AURELIX?.getReport?.();
-    const waves = Array.isArray(report?.gateTopology?.waves) ? report.gateTopology.waves : [];
+    let waves = Array.isArray(report?.gateTopology?.waves) ? report.gateTopology.waves.filter(w => w?.url) : [];
+    if (!waves.length) {
+      waves = await discoverFallbackGateWaves();
+    }
     const seen = new Set();
     const out = [];
-    for (const wave of waves) {
-        if (state.status !== ENGINE_STATES.RUNNING) break;
-        if (!wave?.url) continue;
-        let page = 1;
-        let maxPages = 1;
-        while (page <= maxPages && state.status === ENGINE_STATES.RUNNING) {
-          try {
-            const u = new URL(wave.url, location.origin);
-            u.searchParams.set('dead_page', String(page));
-            u.searchParams.set('_aurelix_loot', String(Date.now()));
-            const { res, text } = await withGateDeadViewRequest(() => fetchText(u.href, {
-              headers: { 'X-Requested-With': 'XMLHttpRequest' },
-              signal: state.abortController?.signal
-            }));
-            if (res.status === 429) {
-              const retry = Number(res.headers.get('Retry-After'));
-              await sleep(Number.isFinite(retry) && retry > 0 ? retry * 1000 : 3000);
-              break;
-            }
-            if (!res.ok) break;
-            const doc = docFromHtml(text);
-            updateLiveResourcesFromDocument(doc);
-            maxPages = Math.max(maxPages, deadLootMaxPages(doc));
-            for (const card of doc.querySelectorAll('.monster-card[data-dead="1"],.monster-card,.mon.dead,.mon')) {
-              const candidate = gateLootCandidateFromCard(card, wave);
-              if (!candidate || seen.has(candidate.key)) continue;
-              seen.add(candidate.key);
-              out.push(candidate);
-            }
-            page += 1;
-          } catch (error) {
-            if (error?.name === 'AbortError') throw error;
-            pushLog('warning', `AUTO LOOT — Gate loot discovery failed for Gate ${wave?.gateId ?? '?'} / Wave ${wave?.waveId ?? '?'}: ${error?.message || error}`);
-            break;
-          }
+    const collectFromDoc = (doc, wave) => {
+      updateLiveResourcesFromDocument(doc);
+      for (const card of doc.querySelectorAll('.monster-card[data-dead="1"],.monster-card,.mon.dead,.mon')) {
+        const candidate = gateLootCandidateFromCard(card, wave);
+        if (!candidate || seen.has(candidate.key)) continue;
+        seen.add(candidate.key);
+        out.push(candidate);
       }
-    }
+    };
+    const fetchWaveDeadPage = async (wave, page) => {
+      const u = new URL(wave.url, location.origin);
+      u.searchParams.set('dead_page', String(page));
+      u.searchParams.set('_aurelix_loot', String(Date.now()));
+      const { res, text } = await withGateDeadViewRequest(() => fetchText(u.href, {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        signal: state.abortController?.signal
+      }));
+      if (res.status === 429) {
+        const retry = Number(res.headers.get('Retry-After'));
+        await sleep(Number.isFinite(retry) && retry > 0 ? retry * 1000 : 3000);
+        return null;
+      }
+      if (!res.ok) return null;
+      return docFromHtml(text);
+    };
+    await mapWithConcurrency(waves, 4, async wave => {
+      if (!allowWhenStopped && state.status !== ENGINE_STATES.RUNNING) return;
+      if (!wave?.url) return;
+      try {
+        const firstDoc = await fetchWaveDeadPage(wave, 1);
+        if (!firstDoc) return;
+        collectFromDoc(firstDoc, wave);
+        const maxPages = deadLootMaxPages(firstDoc);
+        if (maxPages > 1) {
+          const extraPages = [];
+          for (let p = 2; p <= maxPages; p += 1) extraPages.push(p);
+          await mapWithConcurrency(extraPages, 4, async page => {
+            if (!allowWhenStopped && state.status !== ENGINE_STATES.RUNNING) return;
+            const doc = await fetchWaveDeadPage(wave, page);
+            if (doc) collectFromDoc(doc, wave);
+          });
+        }
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        pushLog('warning', `AUTO LOOT — Gate loot discovery failed for Gate ${wave?.gateId ?? '?'} / Wave ${wave?.waveId ?? '?'}: ${error?.message || error}`);
+      }
+    });
     return out;
   }
   function lootButtonAvailable(doc) {
@@ -6835,6 +7478,7 @@ async function aurelixGetUpdateStatus(force = false) {
       if (!lootEvidence) return null;
       const cfg = parseBattleCfg(doc);
       if (candidate.source === 'dungeon') {
+        if (!lootButtonAvailable(doc)) return null;
         if (!cfg.isDungeon || !(cfg.instanceId > 0) || !(cfg.dgmid > 0)) return null;
         if (Number(cfg.instanceId) !== Number(candidate.instanceId) || Number(cfg.dgmid) !== Number(candidate.dgmid)) return null;
       } else {
@@ -6865,8 +7509,7 @@ async function aurelixGetUpdateStatus(force = false) {
     return m ? Math.max(0, parseNumber(m[1]) || 0) : 0;
   }
   async function claimOneLoot(candidate, preverified = undefined) {
-    // Dungeon claims are deliberately blocked; this engine only auto-loots Gate/Wave targets.
-    if (candidate?.source === 'dungeon') return { ok:false, reason:'dungeon-loot-disabled' };
+    if (!candidate) return { ok: false, reason: 'invalid-candidate' };
     const verified = preverified === undefined ? await verifyLootCandidate(candidate) : preverified;
     if (!verified) {
       const retryAt = Date.now() + LOOT_REJECT_COOLDOWN_MS;
@@ -7003,26 +7646,56 @@ async function aurelixGetUpdateStatus(force = false) {
       pushLog('warning', 'AUTO LOOT — player level could not be verified; no loot request was sent.');
       return false;
     }
-    // Dungeon loot is temporarily disabled. Continue directly to Gate/Wave recovery loot.
-
     state.lootInFlight = true;
     try {
-      pushLog('loot', `🎁 AUTO LOOT — Gate recovery pass: Stamina ${Math.max(0, Math.round(Number(currentStamina()) || 0))} (<${AUTO_LOOT_STAMINA_TRIGGER}) and ${Math.round(threshold.remainingExp).toLocaleString()} EXP remains inside the ${threshold.thresholdPct}% window.`);
+      pushLog('loot', `🎁 AUTO LOOT — Closed Dungeon recovery pass: Stamina ${Math.max(0, Math.round(Number(currentStamina()) || 0))} (<${AUTO_LOOT_STAMINA_TRIGGER}) and ${Math.round(threshold.remainingExp).toLocaleString()} EXP remains inside the ${threshold.thresholdPct}% window.`);
+      const dungeonCandidates = await discoverClosedDungeonLootCandidates();
+      state.session.stats.mobsUnlooted = new Set(dungeonCandidates.map(x => x.key)).size;
+      emit();
+
+      if (dungeonCandidates.length) {
+        pushLog('loot', `AUTO LOOT — ${dungeonCandidates.length} joined + not looted Dungeon candidate${dungeonCandidates.length === 1 ? '' : 's'} found.`);
+        const dungeonResult = await processLootCandidates(dungeonCandidates, { stopOnRecovery: true, initialLevel, initialStamina: fresh.stamina });
+        if (dungeonResult === 'recovered') return true;
+      } else {
+        pushLog('loot', 'AUTO LOOT — no joined, not looted closed Dungeon loot found; checking Gate/Wave loot.');
+      }
+
       const gateCandidates = await discoverGateLootCandidates();
-      state.session.stats.mobsUnlooted = new Set(gateCandidates.map(x => x.key)).size;
+      state.session.stats.mobsUnlooted = new Set([
+        ...dungeonCandidates.map(x => x.key),
+        ...gateCandidates.map(x => x.key)
+      ]).size;
       emit();
       if (!gateCandidates.length) {
-        pushLog('loot', 'AUTO LOOT — no joined, dead, unclaimed Gate/Wave loot found.');
+        pushLog(dungeonCandidates.length ? 'warning' : 'loot', dungeonCandidates.length
+          ? 'AUTO LOOT — available Dungeon loot was exhausted without a level-up, and no Gate/Wave loot was found; stamina potion remains blocked inside the EXP window.'
+          : 'AUTO LOOT — no joined, dead, unclaimed Dungeon or Gate/Wave loot found.');
         return false;
       }
-      pushLog('loot', `AUTO LOOT — ${gateCandidates.length} joined + dead + unclaimed Gate candidate${gateCandidates.length === 1 ? '' : 's'} found.`);
-      const result = await processLootCandidates(gateCandidates, { stopOnRecovery: true, initialLevel, initialStamina:fresh.stamina });
+      pushLog('loot', `🎁 AUTO LOOT — Gate recovery pass: ${gateCandidates.length} joined + dead + unclaimed Gate candidate${gateCandidates.length === 1 ? '' : 's'} found.`);
+      const result = await processLootCandidates(gateCandidates, { stopOnRecovery: true, initialLevel, initialStamina: fresh.stamina });
       if (result === 'recovered') return true;
-      pushLog('warning', 'AUTO LOOT — available Gate/Wave loot was exhausted without a level-up; stamina potion remains blocked inside the EXP window.');
+      pushLog('warning', 'AUTO LOOT — available Dungeon and Gate/Wave loot was exhausted without a level-up; stamina potion remains blocked inside the EXP window.');
       return false;
     } finally {
       state.lootInFlight = false;
     }
+  }
+  async function scanManualLoot(kind = 'dungeon') {
+    const normalized = kind === 'gate' ? 'gate' : 'dungeon';
+    const candidates = normalized === 'gate'
+      ? await discoverGateLootCandidates({ allowWhenStopped: true })
+      : await discoverClosedDungeonLootCandidates({ allowWhenStopped: true });
+    return {
+      ok: true,
+      kind: normalized,
+      candidates: clone(candidates)
+    };
+  }
+  async function claimManualLoot(candidate) {
+    if (!candidate || !candidate.key) return { ok: false, reason: 'invalid-candidate', message: 'Invalid loot candidate.' };
+    return await claimOneLoot(candidate);
   }
   function directSkillModelKey(target, skill) {
     const encounter = runtimeEncounterKey(target);
@@ -7671,6 +8344,7 @@ async function aurelixGetUpdateStatus(force = false) {
     return result;
   }
 
+  /* --- 6.7 Combat Loop, Lifecycle & Public API --- */
   async function executeCombatTarget(target) {
     if (!target || state.status !== ENGINE_STATES.RUNNING) return;
     pipelineStage('decide', 'Confirming target and phase');
@@ -7678,6 +8352,17 @@ async function aurelixGetUpdateStatus(force = false) {
     if (!snapshot.ok || !snapshot.identityOk) {
       pushLog('warning', `Target state changed before combat: ${target.name}.`);
       await reconcileScanner();
+      return;
+    }
+    if (target.specialType === 'grakthar-general' && snapshot.generalPhase === 1) {
+      const key = runtimeEncounterKey(target);
+      state.combatRejectedUntil.set(key, Date.now() + 10_000);
+      const waitKey = `general-p1:${key}`;
+      if (Date.now() - Number(state.phaseWaitLogAt[waitKey] || 0) >= 30_000) {
+        state.phaseWaitLogAt[waitKey] = Date.now();
+        pushLog('phase', `${target.name} is still in Phase 1; skipping until Phase 2.`);
+      }
+      invalidateCombatPreflight(target);
       return;
     }
     if (snapshot.phaseDuel) {
@@ -8066,7 +8751,6 @@ async function aurelixGetUpdateStatus(force = false) {
     state.dungeonLootSweepPromise = null;
     state.lastDungeonLootSweepAt = 0;
     state.lastSmartLootAttemptAt = 0;
-    state.dungeonLootRetryAfter = 0;
     state.lootCandidateRejectedUntil.clear();
   }
   async function start() {
@@ -8109,6 +8793,9 @@ async function aurelixGetUpdateStatus(force = false) {
     }
     state.currentTarget = null;
     state.currentPlan = null;
+    state.phase1WaitingGenerals = [];
+    state.phaseWaitingTargets = [];
+    window.AURELIX?.setPhaseWatchTargets?.([]);
     state.status = ENGINE_STATES.OFF;
     pushLog('stop', 'AURELIX stopped.');
     emit();
@@ -8286,6 +8973,8 @@ async function aurelixGetUpdateStatus(force = false) {
     applyLoadoutAssignment,
     saveAllConfiguration,
     refreshActiveSkills,
+    scanManualLoot,
+    claimManualLoot,
     getLogs,
     subscribe,
     logicalTargetKey,
@@ -8293,9 +8982,14 @@ async function aurelixGetUpdateStatus(force = false) {
   });
   console.log('[AURELIX] Combat Engine v' + ENGINE_VERSION + ' loaded. Live PvE combat enabled.');
 })();
+
+/* ========================================================================
+   MODULE 7: GAME CONTROL CONSOLE UI (v0.7.4)
+   Floating UI console, CSS themes, view renderers, diagnostics & live sync.
+   ======================================================================== */
 (() => {
   'use strict';
-  const VERSION = '0.7.2';
+  const VERSION = '0.7.4';
   const STORE = Object.freeze({
     tab: 'aurelix_ui_tab_v020',
     minimized: 'aurelix_ui_minimized_v020',
@@ -8606,6 +9300,37 @@ async function aurelixGetUpdateStatus(force = false) {
   #aurelix-ui .ax-summary-detail-row:last-child { border-bottom:0; }
   #aurelix-ui .ax-summary-detail-time { color:var(--ax-muted); font-family:monospace; white-space:nowrap; }
   #aurelix-ui .ax-summary-empty { color:var(--ax-muted); padding:3px 0; }
+
+  /* Manual Loot Panel */
+  #aurelix-ui .ax-manual-loot-body { padding: 14px 16px; display: grid; gap: 12px; }
+  #aurelix-ui .ax-manual-loot-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  #aurelix-ui .ax-manual-loot-btn { padding: 10px 12px; border-radius: 7px; border: 1px solid var(--ax-line-strong); background: rgba(255,255,255,0.04); color: #fff; font-family: inherit; font-size: calc(12px * var(--ax-scale)); font-weight: 700; cursor: pointer; transition: all 0.16s ease; display: flex; align-items: center; justify-content: center; gap: 6px; }
+  #aurelix-ui .ax-manual-loot-btn:hover:not(:disabled) { border-color: var(--ax-cyan); background: rgba(67,216,255,0.1); color: var(--ax-cyan); }
+  #aurelix-ui .ax-manual-loot-btn.active { border-color: var(--ax-gold); background: rgba(255,193,7,0.12); color: var(--ax-gold); }
+  #aurelix-ui .ax-manual-loot-btn:disabled { opacity: 0.55; cursor: wait; }
+  #aurelix-ui .ax-manual-loot-panel { display: none; border: 1px solid var(--ax-line); border-radius: 8px; background: rgba(0,0,0,0.22); overflow: hidden; }
+  #aurelix-ui .ax-manual-loot-panel.open { display: block; }
+  #aurelix-ui .ax-manual-loot-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.07); background: rgba(0,0,0,0.22); font-size: calc(12px * var(--ax-scale)); }
+  #aurelix-ui .ax-manual-loot-head strong { color: #fff; }
+  #aurelix-ui .ax-manual-loot-head-btns { display: flex; align-items: center; gap: 6px; }
+  #aurelix-ui .ax-manual-loot-all-btn { padding: 5px 10px; border-radius: 5px; border: 1px solid rgba(46,204,113,0.45); background: rgba(46,204,113,0.16); color: var(--ax-green); font-family: inherit; font-size: calc(11px * var(--ax-scale)); font-weight: 700; cursor: pointer; }
+  #aurelix-ui .ax-manual-loot-all-btn:hover:not(:disabled) { background: rgba(46,204,113,0.28); }
+  #aurelix-ui .ax-manual-loot-all-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  #aurelix-ui .ax-manual-loot-close-btn { padding: 5px 8px; border-radius: 5px; border: 1px solid var(--ax-line); background: transparent; color: var(--ax-muted); font-family: inherit; font-size: calc(11px * var(--ax-scale)); cursor: pointer; }
+  #aurelix-ui .ax-manual-loot-close-btn:hover { color: #fff; border-color: rgba(255,255,255,0.25); }
+  #aurelix-ui .ax-manual-loot-list { max-height: 260px; overflow-y: auto; display: grid; }
+  #aurelix-ui .ax-manual-loot-item { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  #aurelix-ui .ax-manual-loot-item:last-child { border-bottom: 0; }
+  #aurelix-ui .ax-manual-loot-info { min-width: 0; }
+  #aurelix-ui .ax-manual-loot-name { color: #fff; font-size: calc(12px * var(--ax-scale)); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #aurelix-ui .ax-manual-loot-meta { color: var(--ax-muted); font-size: calc(11px * var(--ax-scale)); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #aurelix-ui .ax-manual-loot-claim-btn { flex-shrink: 0; padding: 5px 10px; border-radius: 5px; border: 1px solid rgba(67,216,255,0.45); background: rgba(67,216,255,0.14); color: var(--ax-cyan); font-family: inherit; font-size: calc(11px * var(--ax-scale)); font-weight: 700; cursor: pointer; }
+  #aurelix-ui .ax-manual-loot-claim-btn:hover:not(:disabled) { background: rgba(67,216,255,0.26); }
+  #aurelix-ui .ax-manual-loot-claim-btn:disabled { opacity: 0.55; cursor: wait; }
+  #aurelix-ui .ax-manual-loot-badge { flex-shrink: 0; font-size: calc(11px * var(--ax-scale)); font-weight: 700; font-family: monospace; white-space: nowrap; }
+  #aurelix-ui .ax-manual-loot-badge.ok { color: var(--ax-green); }
+  #aurelix-ui .ax-manual-loot-badge.err { color: var(--ax-red); }
+  #aurelix-ui .ax-manual-loot-empty { padding: 14px 12px; text-align: center; color: var(--ax-muted); font-size: calc(12px * var(--ax-scale)); }
 
   /* Shared Form Elements */
   /* ===== LOCATION 3D ICON GRID (Target Section) ===== */
@@ -9817,7 +10542,7 @@ async function aurelixGetUpdateStatus(force = false) {
     #aurelix-ui button { transition:none !important; }
   }
 
-  /* v0.7.2 low-memory + small-screen hardening */
+  /* v0.7.3 low-memory + small-screen hardening */
   @media (max-width:860px), (pointer:coarse) and (max-width:1200px) {
     #aurelix-ui {
       width:100% !important;
@@ -9893,7 +10618,7 @@ async function aurelixGetUpdateStatus(force = false) {
   }
 
 
-  /* v0.7.2 UI polish: native filters styled to match AURELIX dark/gold theme */
+  /* v0.7.3 UI polish: native filters styled to match AURELIX dark/gold theme */
   #aurelix-ui #ax-target-type-filter,
   #aurelix-ui #ax-assignment-type-filter {
     appearance:none !important;
@@ -10613,25 +11338,49 @@ async function aurelixGetUpdateStatus(force = false) {
                 </div>
               </article>
             </div>
-            <article class="ax-card ax-summary">
-              <div class="ax-card-head">
-                <h3>📊 Session Summary</h3>
-              </div>
-              <div class="ax-summary-body">
-                <div class="ax-summary-row"><span>Runtime</span><b id="ax-sum-runtime">00:00:00</b></div>
-                <div class="ax-summary-row ax-summary-clickable" id="ax-summary-completed-row" role="button" tabindex="0" aria-expanded="false"><span>Targets Completed</span><b id="ax-sum-completed">0</b></div>
-                <div class="ax-summary-detail" id="ax-summary-completed-detail"></div>
-                <div class="ax-summary-row"><span>Total Damage</span><b id="ax-sum-damage">0</b></div>
-                <div class="ax-summary-row"><span>Stamina Used</span><b id="ax-sum-stamina">0</b></div>
-                <div class="ax-summary-row"><span>HP Potions</span><b id="ax-sum-hp-potions">0</b></div>
-                <div class="ax-summary-row"><span>Stamina Potions</span><b id="ax-sum-stamina-potions">0</b></div>
-                <div class="ax-summary-row"><span>Mana Potions</span><b id="ax-sum-mana-potions">0</b></div>
-                <div class="ax-summary-row"><span>Mobs Looted</span><b id="ax-sum-mobs-looted">0</b></div>
-                <div class="ax-summary-row"><span>XP Looted</span><b id="ax-sum-xp-loot">0</b></div>
-                <div class="ax-summary-row ax-summary-clickable" id="ax-summary-errors-row" role="button" tabindex="0" aria-expanded="false"><span>Errors</span><b id="ax-sum-errors" style="color:var(--ax-red)">0</b></div>
-                <div class="ax-summary-detail" id="ax-summary-errors-detail"></div>
-              </div>
-            </article>
+            <div>
+              <article class="ax-card ax-summary">
+                <div class="ax-card-head">
+                  <h3>📊 Session Summary</h3>
+                </div>
+                <div class="ax-summary-body">
+                  <div class="ax-summary-row"><span>Runtime</span><b id="ax-sum-runtime">00:00:00</b></div>
+                  <div class="ax-summary-row ax-summary-clickable" id="ax-summary-completed-row" role="button" tabindex="0" aria-expanded="false"><span>Targets Completed</span><b id="ax-sum-completed">0</b></div>
+                  <div class="ax-summary-detail" id="ax-summary-completed-detail"></div>
+                  <div class="ax-summary-row"><span>Total Damage</span><b id="ax-sum-damage">0</b></div>
+                  <div class="ax-summary-row"><span>Stamina Used</span><b id="ax-sum-stamina">0</b></div>
+                  <div class="ax-summary-row"><span>HP Potions</span><b id="ax-sum-hp-potions">0</b></div>
+                  <div class="ax-summary-row"><span>Stamina Potions</span><b id="ax-sum-stamina-potions">0</b></div>
+                  <div class="ax-summary-row"><span>Mana Potions</span><b id="ax-sum-mana-potions">0</b></div>
+                  <div class="ax-summary-row"><span>Mobs Looted</span><b id="ax-sum-mobs-looted">0</b></div>
+                  <div class="ax-summary-row"><span>XP Looted</span><b id="ax-sum-xp-loot">0</b></div>
+                  <div class="ax-summary-row ax-summary-clickable" id="ax-summary-errors-row" role="button" tabindex="0" aria-expanded="false"><span>Errors</span><b id="ax-sum-errors" style="color:var(--ax-red)">0</b></div>
+                  <div class="ax-summary-detail" id="ax-summary-errors-detail"></div>
+                </div>
+              </article>
+              <article class="ax-card ax-manual-loot">
+                <div class="ax-card-head">
+                  <h3>🎁 Manual Loot</h3>
+                  <span id="ax-manual-loot-status" style="color:var(--ax-muted); font-size:12px;">Ready</span>
+                </div>
+                <div class="ax-manual-loot-body">
+                  <div class="ax-manual-loot-actions">
+                    <button type="button" class="ax-manual-loot-btn" id="ax-manual-loot-dungeon-btn">🏰 Dungeon Loot</button>
+                    <button type="button" class="ax-manual-loot-btn" id="ax-manual-loot-gate-btn">🌌 Gate Loot</button>
+                  </div>
+                  <div class="ax-manual-loot-panel" id="ax-manual-loot-panel">
+                    <div class="ax-manual-loot-head">
+                      <strong id="ax-manual-loot-title">Lootable Monsters</strong>
+                      <div class="ax-manual-loot-head-btns">
+                        <button type="button" class="ax-manual-loot-all-btn" id="ax-manual-loot-all-btn">Loot All</button>
+                        <button type="button" class="ax-manual-loot-close-btn" id="ax-manual-loot-close-btn" title="Hide list">✕</button>
+                      </div>
+                    </div>
+                    <div class="ax-manual-loot-list" id="ax-manual-loot-list"></div>
+                  </div>
+                </div>
+              </article>
+            </div>
           </div>
         </section>
         <section class="ax-view" data-view="combat">
@@ -10926,6 +11675,7 @@ async function aurelixGetUpdateStatus(force = false) {
                 </div>
                 <div class="ax-setting-copy"><small>No combat, scans, requests or preset changes are triggered. The report is generated only when requested. Review before sharing; monster names and your configuration may be included. Authentication tokens and raw HTML are not collected.</small></div>
                 <div id="ax-diag-status" role="status" style="color:var(--ax-muted);font-size:12px">Ready. Capture a snapshot after the problem occurs.</div>
+                <div id="ax-diag-summary-box" style="display:none;border:1px solid var(--ax-border);border-radius:10px;padding:12px;background:rgba(8,14,28,.75);font-size:12px;line-height:1.5"></div>
                 <textarea id="ax-diag-output" readonly spellcheck="false" placeholder="Diagnostic JSON will appear here" style="width:100%;box-sizing:border-box;min-height:180px;max-height:340px;resize:vertical;-webkit-user-select:text;user-select:text;touch-action:pan-y;background:rgba(4,9,20,.72);color:var(--ax-text);border:1px solid var(--ax-border);border-radius:10px;padding:12px;font:11px/1.5 monospace"></textarea>
               </div>
             </article>
@@ -11145,7 +11895,9 @@ async function aurelixGetUpdateStatus(force = false) {
         ? issues.map(x => {
             const d = new Date(x.at || Date.now());
             const time = Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-            return `<div class="ax-summary-detail-row"><span>${safe(x.message || 'Unknown error')}</span><span class="ax-summary-detail-time">${safe(time)}</span></div>`;
+            const diag = typeof AURELIX_TRACE?.classifyErrorCause === 'function' ? AURELIX_TRACE.classifyErrorCause(x.message || '', { stage: x.type }) : null;
+            const causeNote = diag ? `<div style="color:var(--ax-muted);font-size:10px;margin-top:2px;">Cause: ${safe(diag.rootCause)}</div>` : '';
+            return `<div class="ax-summary-detail-row"><div><span>${safe(x.message || 'Unknown error')}</span>${causeNote}</div><span class="ax-summary-detail-time">${safe(time)}</span></div>`;
           }).join('')
         : '<div class="ax-summary-empty">No errors recorded in this session.</div>';
     }
@@ -11914,9 +12666,25 @@ async function aurelixGetUpdateStatus(force = false) {
       (byGate[k] ||= []).push({ name: String(e.name || '').slice(0,120), entityId: e.entityId ?? null, eligible: e.targetEligible ?? null });
     }
     const shortRows = (items, keys, max=250) => Array.isArray(items) ? items.slice(0,max).map(x => axDiagFields(x,keys)) : [];
+    const investigation = AURELIX_TRACE.analyze({ scan, runtime, logs });
+    const summaryReport = {
+      health: investigation.health,
+      headline: investigation.headline,
+      counts: investigation.counts,
+      primaryIssue: investigation.primaryIssue,
+      diagnoses: investigation.diagnoses,
+      errorTimeline: Array.isArray(logs)
+        ? logs.filter(x => x && (x.level === 'error' || x.level === 'warning' || x.type === 'error' || x.type === 'warning')).slice(-20).map(x => {
+            const cause = AURELIX_TRACE.classifyErrorCause(x.message || '', { stage: x.level || x.type });
+            return { at: x.time || x.timestamp || x.at || null, level: x.level || x.type, message: String(x.message || '').slice(0, 300), category: cause.category, rootCause: cause.rootCause, reason: cause.reason };
+          })
+        : []
+    };
+    axRenderDiagnosticSummary(summaryReport);
     const report = {
-      diagnosticVersion: '4.0', capturedAt: new Date().toISOString(),
-      automatedInvestigation: AURELIX_TRACE.analyze(),
+      diagnosticVersion: '5.0', capturedAt: new Date().toISOString(),
+      summaryReport,
+      automatedInvestigation: investigation,
       context: { page: location.pathname, visibility: document.visibilityState, viewport: {width:innerWidth,height:innerHeight}, device: /Android|Mobile|iPhone/i.test(navigator.userAgent)?'mobile':'desktop', online:navigator.onLine },
       api: { scannerVersion:window.AURELIX?.version || null, engineVersion:window.AURELIX_ENGINE?.version || null, scanner:!!window.AURELIX?.getReport, engine:!!window.AURELIX_ENGINE?.getRuntimeState, uiTargets:appState.targets?.length ?? null },
       scanner: {
@@ -11943,6 +12711,38 @@ async function aurelixGetUpdateStatus(force = false) {
       return v;
     },2);
     return json.replace(/(Bearer\s+)[A-Za-z0-9._~-]+/gi,'$1[REDACTED]');
+  }
+  function axRenderDiagnosticSummary(summary) {
+    const box = $('#ax-diag-summary-box');
+    if (!box || !summary) return;
+    const badgeColor = summary.health === 'CRITICAL' ? 'var(--ax-red)' : (summary.health === 'DEGRADED' ? 'var(--ax-gold)' : 'var(--ax-green)');
+    const diagnoses = Array.isArray(summary.diagnoses) ? summary.diagnoses : [];
+    const issuesHtml = diagnoses.length
+      ? diagnoses.map(d => {
+          const sevColor = d.severity === 'critical' ? 'var(--ax-red)' : 'var(--ax-gold)';
+          const samples = Array.isArray(d.sampleMessages) && d.sampleMessages.length
+            ? `<div style="margin-top:4px;color:var(--ax-muted);font-family:monospace;font-size:11px;">Evidence: ${safe(d.sampleMessages[0])}</div>`
+            : '';
+          return `<div style="padding:8px 10px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;background:rgba(0,0,0,0.22);margin-top:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+              <strong style="color:${sevColor}">[${safe(String(d.severity || 'info').toUpperCase())}] ${safe(d.title)}</strong>
+              <span style="color:var(--ax-muted);font-family:monospace;font-size:11px;">×${fmt(d.occurrences || 1)}</span>
+            </div>
+            <div style="margin-top:4px;"><b>Root Cause:</b> ${safe(d.rootCause)}</div>
+            <div style="margin-top:2px;"><b>Reason:</b> ${safe(d.reason)}</div>
+            <div style="margin-top:2px;color:var(--ax-muted);"><b>Impact:</b> ${safe(d.impact)}</div>
+            <div style="margin-top:2px;color:var(--ax-cyan);"><b>Fix:</b> ${safe(d.remediation)}</div>
+            ${samples}
+          </div>`;
+        }).join('')
+      : `<div style="margin-top:8px;color:var(--ax-green);">All systems healthy — no errors, failed requests, or exceptions recorded.</div>`;
+    box.style.display = 'block';
+    box.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08);">
+      <strong>Diagnosis Summary</strong>
+      <span style="font-weight:800;color:${badgeColor};font-family:monospace;">${safe(summary.health || 'HEALTHY')}</span>
+    </div>
+    <div style="margin-top:6px;color:#fff;">${safe(summary.headline || '')}</div>
+    ${issuesHtml}`;
   }
   function axDiagStatus(message) { const el=$('#ax-diag-status'); if(el) el.textContent=message; }
   function axSelectDiagnostic() {
@@ -13336,6 +14136,189 @@ renderAurelixUpdateCenter();
     row?.addEventListener('click', () => toggleSummaryDetail(rowId, detailId));
     row?.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleSummaryDetail(rowId, detailId); } });
   }
+  const manualLootState = {
+    open: false,
+    kind: null,
+    scanning: false,
+    lootingAll: false,
+    stopRequested: false,
+    items: []
+  };
+  function formatManualLootMeta(candidate) {
+    if (!candidate) return '';
+    if (candidate.source === 'dungeon') {
+      const parts = [candidate.dungeonName || 'Closed Dungeon'];
+      if (candidate.locationName) parts.push(candidate.locationName);
+      if (candidate.instanceId) parts.push(`#${candidate.instanceId}${candidate.status ? ` (${candidate.status})` : ''}`);
+      return parts.join(' • ');
+    }
+    return `Gate ${candidate.gateId ?? '?'} • Wave ${candidate.waveId ?? '?'}`;
+  }
+  function renderManualLoot() {
+    const dungeonBtn = $('#ax-manual-loot-dungeon-btn');
+    const gateBtn = $('#ax-manual-loot-gate-btn');
+    const statusEl = $('#ax-manual-loot-status');
+    const panel = $('#ax-manual-loot-panel');
+    const titleEl = $('#ax-manual-loot-title');
+    const allBtn = $('#ax-manual-loot-all-btn');
+    const listEl = $('#ax-manual-loot-list');
+    if (!panel || !listEl) return;
+
+    if (dungeonBtn) {
+      dungeonBtn.disabled = manualLootState.scanning || manualLootState.lootingAll;
+      dungeonBtn.classList.toggle('active', manualLootState.open && manualLootState.kind === 'dungeon');
+      dungeonBtn.textContent = manualLootState.scanning && manualLootState.kind === 'dungeon' ? '🏰 Scanning…' : '🏰 Dungeon Loot';
+    }
+    if (gateBtn) {
+      gateBtn.disabled = manualLootState.scanning || manualLootState.lootingAll;
+      gateBtn.classList.toggle('active', manualLootState.open && manualLootState.kind === 'gate');
+      gateBtn.textContent = manualLootState.scanning && manualLootState.kind === 'gate' ? '🌌 Scanning…' : '🌌 Gate Loot';
+    }
+
+    const pendingCount = manualLootState.items.filter(item => item.status === 'ready' || item.status === 'error').length;
+    const lootedCount = manualLootState.items.filter(item => item.status === 'looted').length;
+    if (statusEl) {
+      if (manualLootState.scanning) statusEl.textContent = 'Scanning…';
+      else if (manualLootState.lootingAll) statusEl.textContent = `Looting (${lootedCount}/${manualLootState.items.length})…`;
+      else if (manualLootState.open) statusEl.textContent = `${pendingCount} available`;
+      else statusEl.textContent = 'Ready';
+    }
+
+    panel.classList.toggle('open', manualLootState.open);
+    if (!manualLootState.open) return;
+
+    const label = manualLootState.kind === 'gate' ? '🌌 Gate Loot' : '🏰 Closed Dungeon Loot';
+    if (titleEl) titleEl.textContent = `${label} (${pendingCount})`;
+    if (allBtn) {
+      allBtn.textContent = manualLootState.lootingAll ? 'Stop' : `Loot All (${pendingCount})`;
+      allBtn.disabled = manualLootState.scanning || (!manualLootState.lootingAll && pendingCount === 0);
+    }
+
+    if (manualLootState.scanning) {
+      listEl.innerHTML = `<div class="ax-manual-loot-empty">Scanning ${manualLootState.kind === 'gate' ? 'Gate waves' : 'closed Dungeons'} for joined, not looted monsters…</div>`;
+      return;
+    }
+    if (!manualLootState.items.length) {
+      listEl.innerHTML = `<div class="ax-manual-loot-empty">No joined, not looted ${manualLootState.kind === 'gate' ? 'Gate' : 'closed Dungeon'} monsters found.</div>`;
+      return;
+    }
+
+    listEl.innerHTML = manualLootState.items.map(item => {
+      const c = item.candidate;
+      let actionHtml = '';
+      if (item.status === 'looted') {
+        const expText = item.expGained > 0 ? ` (+${fmt(item.expGained)} EXP)` : '';
+        actionHtml = `<span class="ax-manual-loot-badge ok">✅ Looted${expText}</span>`;
+      } else if (item.status === 'claiming') {
+        actionHtml = `<button type="button" class="ax-manual-loot-claim-btn" disabled>Looting…</button>`;
+      } else {
+        const errHint = item.status === 'error' && item.message ? ` title="${safe(item.message)}"` : '';
+        const errBadge = item.status === 'error' ? `<span class="ax-manual-loot-badge err"${errHint}>⚠️</span>` : '';
+        actionHtml = `${errBadge}<button type="button" class="ax-manual-loot-claim-btn" data-loot-key="${safe(c.key)}"${manualLootState.lootingAll ? ' disabled' : ''}>Loot</button>`;
+      }
+      return `<div class="ax-manual-loot-item">
+        <div class="ax-manual-loot-info">
+          <div class="ax-manual-loot-name">${safe(c.name || 'Monster')}</div>
+          <div class="ax-manual-loot-meta">${safe(formatManualLootMeta(c))}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">${actionHtml}</div>
+      </div>`;
+    }).join('');
+  }
+  async function runManualLootScan(kind) {
+    if (manualLootState.scanning || manualLootState.lootingAll) return;
+    if (!window.AURELIX_ENGINE?.scanManualLoot) {
+      addLog('error', 'Manual loot is unavailable: engine API not loaded.');
+      return;
+    }
+    manualLootState.open = true;
+    manualLootState.kind = kind;
+    manualLootState.scanning = true;
+    manualLootState.items = [];
+    renderManualLoot();
+    try {
+      const res = await window.AURELIX_ENGINE.scanManualLoot(kind);
+      const candidates = Array.isArray(res?.candidates) ? res.candidates : [];
+      manualLootState.items = candidates.map(candidate => ({
+        candidate,
+        status: 'ready',
+        expGained: 0,
+        message: ''
+      }));
+      addLog('loot', `MANUAL LOOT — Found ${candidates.length} joined, not looted ${kind === 'gate' ? 'Gate' : 'closed Dungeon'} monster${candidates.length === 1 ? '' : 's'}.`);
+    } catch (error) {
+      addLog('error', `Manual ${kind} loot scan failed: ${error?.message || error}`);
+    } finally {
+      manualLootState.scanning = false;
+      renderManualLoot();
+    }
+  }
+  async function claimManualLootItem(key) {
+    const item = manualLootState.items.find(entry => entry.candidate?.key === key);
+    if (!item || item.status === 'looted' || item.status === 'claiming') return false;
+    if (!window.AURELIX_ENGINE?.claimManualLoot) return false;
+    item.status = 'claiming';
+    item.message = '';
+    renderManualLoot();
+    try {
+      const res = await window.AURELIX_ENGINE.claimManualLoot(item.candidate);
+      if (res?.ok) {
+        item.status = 'looted';
+        item.expGained = Number(res.expGained) || 0;
+        return true;
+      }
+      item.status = 'error';
+      item.message = res?.message || res?.reason || 'Failed to loot';
+      return false;
+    } catch (error) {
+      item.status = 'error';
+      item.message = error?.message || String(error);
+      return false;
+    } finally {
+      renderManualLoot();
+    }
+  }
+  async function claimAllManualLootItems() {
+    if (manualLootState.lootingAll) {
+      manualLootState.stopRequested = true;
+      return;
+    }
+    const queue = manualLootState.items.filter(item => item.status === 'ready' || item.status === 'error');
+    if (!queue.length) return;
+    manualLootState.lootingAll = true;
+    manualLootState.stopRequested = false;
+    renderManualLoot();
+    let claimed = 0;
+    let totalExp = 0;
+    try {
+      for (const item of queue) {
+        if (manualLootState.stopRequested) break;
+        const ok = await claimManualLootItem(item.candidate.key);
+        if (ok) {
+          claimed += 1;
+          totalExp += Number(item.expGained) || 0;
+        }
+      }
+      addLog('loot', `MANUAL LOOT — Claimed ${claimed}/${queue.length} monster${queue.length === 1 ? '' : 's'} (+${fmt(totalExp)} EXP).`);
+    } finally {
+      manualLootState.lootingAll = false;
+      manualLootState.stopRequested = false;
+      renderManualLoot();
+    }
+  }
+  $('#ax-manual-loot-dungeon-btn')?.addEventListener('click', () => runManualLootScan('dungeon'));
+  $('#ax-manual-loot-gate-btn')?.addEventListener('click', () => runManualLootScan('gate'));
+  $('#ax-manual-loot-all-btn')?.addEventListener('click', () => claimAllManualLootItems());
+  $('#ax-manual-loot-close-btn')?.addEventListener('click', () => {
+    if (manualLootState.lootingAll) manualLootState.stopRequested = true;
+    manualLootState.open = false;
+    renderManualLoot();
+  });
+  $('#ax-manual-loot-list')?.addEventListener('click', event => {
+    const btn = event.target?.closest?.('.ax-manual-loot-claim-btn[data-loot-key]');
+    if (!btn || manualLootState.lootingAll) return;
+    claimManualLootItem(btn.dataset.lootKey);
+  });
   loadPreferences();
   bindPreferences();
   renderStructuralIfVisible();
