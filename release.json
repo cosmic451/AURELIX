@@ -3,7 +3,7 @@
   "released": "2026-11-27",
   "channel": "stable",
   "download_url": "https://raw.githubusercontent.com/cosmic451/AURELIX/refs/heads/main/AURELIX.user.js",
-  "changelog": [out.",
+  "changelog": {
     "🏰 Dungeon Auto Loot Added.",
     "🎁 Added Manual Loot Panel in Overview: Added 🏰 Dungeon Loot and 🌌 Gate Loot buttons below 📊 Session Summary.",
     "🩺 Upgraded Diagnostic Engine (v5.0)"   
